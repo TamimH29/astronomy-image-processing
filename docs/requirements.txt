@@ -1,0 +1,6 @@
+numpy
+scipy
+astropy
+pytest
+# GPU path only (match the CUDA version on the node):
+# cupy-cuda12x
