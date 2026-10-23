@@ -1,5 +1,6 @@
 """Person 2: tiling and merging."""
 from __future__ import annotations
+from dataclasses import replace
 from typing import Iterable, Sequence
 import numpy as np
 from .interfaces import ImageData, Tile, Source
@@ -35,11 +36,27 @@ def make_tiles(img: ImageData, tile_size: int, halo: int) -> list[Tile]:
             ))
     return tiles
 
+def _owns(tile: Tile, x: float, y: float) -> bool:
+    """Ownership rule: centroid inside the tile's half-open core."""
+    cy0, cx0, cy1, cx1 = tile.core
+    return cy0 <= y < cy1 and cx0 <= x < cx1
+
 
 def merge(image_id: str, per_tile: Iterable[Sequence[Source]],
           tiles: Sequence[Tile]) -> list[Source]:
     """Keep only sources whose centroid lies in the owning tile's core, then
     assign unique source_id values (sorted by y, then x for determinism).
-    Test: tiled result must equal whole-image result.
+    source_id starts at 1.
     """
-    raise NotImplementedError
+    per_tile = list(per_tile)               # may be a generator
+    if len(per_tile) != len(tiles):
+        raise ValueError(
+            f"got {len(per_tile)} source lists for {len(tiles)} tiles")
+
+    kept = [s for tile, sources in zip(tiles, per_tile)
+            for s in sources if _owns(tile, s.x_centroid, s.y_centroid)]
+
+    kept.sort(key=lambda s: (s.y_centroid, s.x_centroid,
+                             s.xmin, s.ymin, s.area_pix, s.flux))
+    return [replace(s, image_id=image_id, source_id=i)
+            for i, s in enumerate(kept, start=1)]
