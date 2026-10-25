@@ -1,24 +1,53 @@
-"""Person 3: Gaussian smoothing, CPU reference and GPU port."""
+"""Samuel's C++20/CUDA Gaussian filter behind the shared NumPy interface."""
 from __future__ import annotations
+from importlib import import_module
 import numpy as np
 
 
+def _smooth_native(data: np.ndarray, kernel_sigma: float,
+                   backend: str) -> np.ndarray:
+    try:
+        native = import_module("astroproc")
+    except ModuleNotFoundError as error:
+        if error.name != "astroproc":
+            raise
+        raise ImportError(
+            "Build the astroproc extension and add its build directory to "
+            "PYTHONPATH; see docs/native_filtering.md."
+        ) from error
+
+    config = native.ProcessingConfig()
+    config.gaussian_sigma = kernel_sigma
+    result = native.filter_image(data, config=config, backend=backend)
+    pixels = result["pixels"]
+    # smooth() has no mask return value. Preserve invalid targets as NaN;
+    # the native filter excludes them from neighboring weighted sums.
+    pixels[result["invalid"] != 0] = np.nan
+    return pixels
+
+
 def _smooth_cpu(data: np.ndarray, kernel_sigma: float) -> np.ndarray:
-    """Reference implementation: scipy.fft-based Gaussian smoothing.
-    FREEZE this by Nov 3; the GPU version is validated against it."""
-    raise NotImplementedError
+    """Existing native separable Gaussian, radius ceil(3*sigma), reflect edges."""
+    return _smooth_native(data, kernel_sigma, "cpu")
 
 
 def _smooth_gpu(data: np.ndarray, kernel_sigma: float) -> np.ndarray:
-    """cupy.fft-based version. Copy to device, filter, copy back as NumPy.
-    Import cupy lazily here so CPU-only machines can still import this file.
-    Target: match _smooth_cpu within ~1e-4 relative (float32)."""
-    raise NotImplementedError
+    """Upload, run our horizontal/vertical CUDA kernels, download to NumPy.
+
+    The call is synchronous. CUDA must be compiled in and available; failures
+    propagate rather than silently running the CPU backend.
+    """
+    return _smooth_native(data, kernel_sigma, "cuda")
 
 
 def smooth(data: np.ndarray, kernel_sigma: float, backend: str = "cpu"
            ) -> np.ndarray:
-    """Dispatch on backend ("cpu" or "gpu"). Always returns a NumPy array."""
+    """Dispatch shared backend names; return a new 2D float32 NumPy array.
+
+    Humza supplies tile.data; tiles use halo >= ceil(4 * kernel_sigma).
+    The native binding releases the GIL while computing. This function owns
+    no worker pool and does not change tile coordinates or source records.
+    """
     if backend == "cpu":
         return _smooth_cpu(data, kernel_sigma)
     if backend == "gpu":

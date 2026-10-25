@@ -2,5 +2,5 @@ numpy
 scipy
 astropy
 pytest
-# GPU path only (match the CUDA version on the node):
-# cupy-cuda12x
+pybind11>=2.13
+# Native GPU filtering requires the CUDA toolkit, not CuPy.
