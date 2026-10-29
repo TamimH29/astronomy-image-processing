@@ -49,11 +49,7 @@ def test_tiled_equals_whole_image(tile_size):
     assert len(whole) == 4
     _assert_catalogs_equal(tiled, whole)
 
-
-@pytest.mark.skip(reason="Person 2: 1, 2, 4 workers give identical catalogs")
-def test_worker_count_invariance():
-    ...
-
+#test_worker skip deleted since it exists in test_parallel.py
 
 def test_gpu_matches_cpu():
     cp = pytest.importorskip("cupy", reason="CuPy is not installed")
