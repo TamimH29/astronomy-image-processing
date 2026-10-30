@@ -1,5 +1,7 @@
 """Person 3: background and noise estimation."""
 from __future__ import annotations
+from importlib import import_module
+import os
 import numpy as np
 
 
@@ -51,6 +53,33 @@ def estimate_background(img: np.ndarray, box: int = 64
     if isinstance(box, (bool, np.bool_)) or not isinstance(box, (int, np.integer)) or box < 1:
         raise ValueError("box must be a positive integer")
     box = int(box)
+    backend = os.environ.get("ASTRO_BACKGROUND_BACKEND", "numpy")
+    if backend == "numpy":
+        return _estimate_background_numpy(pixels, box)
+    if backend != "cpp":
+        raise ValueError("ASTRO_BACKGROUND_BACKEND must be numpy or cpp")
+    try:
+        threads = int(os.environ.get("ASTRO_BACKGROUND_THREADS", "1"))
+    except ValueError as error:
+        raise ValueError("ASTRO_BACKGROUND_THREADS must be a positive integer") from error
+    if threads < 1:
+        raise ValueError("ASTRO_BACKGROUND_THREADS must be a positive integer")
+    try:
+        available = len(os.sched_getaffinity(0))
+    except AttributeError:
+        available = os.cpu_count() or 1
+    threads = min(threads, max(1, available))
+    try:
+        native = import_module("astro_pipeline._background_native")
+    except ImportError as error:
+        raise ImportError(
+            "ASTRO_BACKGROUND_BACKEND=cpp requires the native background extension; "
+            "build it with CMake for this Python interpreter"
+        ) from error
+    return native.estimate_background(pixels, min(box, np.iinfo(np.intp).max), threads)
+
+
+def _estimate_background_numpy(pixels: np.ndarray, box: int) -> tuple[np.ndarray, float]:
     height, width = pixels.shape
     ys = list(range(0, height, box))
     xs = list(range(0, width, box))
