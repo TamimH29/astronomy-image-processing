@@ -122,6 +122,10 @@ double median(std::vector<double>& scratch, double* selection_ms) {
 
 template<class Executor>
 Stats clipped_stats(Workspace& data, Executor& executor, double* selection_ms = nullptr) {
+    // Match background.py::_clipped_stats for both mesh levels and global noise:
+    // center = median(samples), noise = 1.4826 * median(abs(samples - center));
+    // retain center +/- 3 * noise for at most five passes, then summarize again.
+    // These fixed constants are independent of DetectionParams.threshold_sigma.
     data.counts.resize(executor.size());
     data.offsets.resize(executor.size());
     auto summarize = [&] {
@@ -139,8 +143,10 @@ Stats clipped_stats(Workspace& data, Executor& executor, double* selection_ms = 
     };
     for (int iteration = 0; iteration < 5; ++iteration) {
         const auto stats = summarize();
+        // A zero MAD also occurs with repeated fill values; it does not establish
+        // that a real exposure is noiseless. Coverage masking is not implemented.
         if (stats.noise == 0) return stats;
-        const double limit = 3 * stats.noise;
+        const double limit = 3 * stats.noise; // Background clipping, not source detection.
         executor.run(data.samples.size(), [&](auto worker, auto begin, auto end) {
             std::size_t kept = 0;
             for (auto i = begin; i < end; ++i)
@@ -260,6 +266,8 @@ double estimate(const float* pixels, std::size_t height, std::size_t width,
     const auto noise_started = Clock::now();
     Workspace global;
     global.samples.resize(count);
+    // Compute pre-filter residuals in float64 from the float32 image and map.
+    // Every input pixel participates, including any finite no-coverage padding.
     workers.run(height, [&](auto, auto begin, auto end) {
         for (auto y = begin; y < end; ++y)
             for (std::size_t x = 0; x < width; ++x)

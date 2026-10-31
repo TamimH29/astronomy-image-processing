@@ -1,4 +1,8 @@
-"""Person 3: background and noise estimation."""
+"""Person 3: CPU background-map and pre-filter noise estimation.
+
+Background clipping rejects statistical outliers; source detection applies a
+separate threshold in detection.py using DetectionParams.threshold_sigma.
+"""
 from __future__ import annotations
 from importlib import import_module
 import os
@@ -18,13 +22,25 @@ def _image_pixels(img: np.ndarray) -> np.ndarray:
 
 
 def _clipped_stats(values: np.ndarray) -> tuple[float, float]:
+    """Return a clipped median and robust noise estimate, in pixel-value units.
+
+    Recompute center = median(samples) and noise = 1.4826 * MAD, where MAD is
+    median(abs(samples - center)). The factor gives a Gaussian-consistent noise
+    scale. Keep samples within center +/- 3 * noise for at most five clipping
+    passes, then summarize the retained samples. This is a symmetric rejection
+    rule, not a brightness cutoff for detecting objects.
+
+    These fixed settings also live in native/background.cpp::clipped_stats;
+    DetectionParams.threshold_sigma does not change them. A zero MAD returns
+    zero noise: valid for constants, but also possible with repeated fill pixels.
+    """
     samples = np.asarray(values, dtype=np.float64).ravel()
     for _ in range(5):
         center = float(np.median(samples))
         noise = float(1.4826 * np.median(np.abs(samples - center)))
         if noise == 0:
             return center, noise
-        keep = np.abs(samples - center) <= 3 * noise
+        keep = np.abs(samples - center) <= 3 * noise  # Fixed background clipping threshold.
         if keep.all():
             return center, noise
         samples = samples[keep]
@@ -45,9 +61,20 @@ def _axis_weights(centers: np.ndarray, length: int):
 
 def estimate_background(img: np.ndarray, box: int = 64
                         ) -> tuple[np.ndarray, float]:
-    """Sigma-clipped median on a coarse grid of `box`-pixel cells, interpolated
-    to full size. Return (background_map, noise_sigma). Runs on the WHOLE
-    image, before tiling (see conventions in interfaces.py).
+    """Return (float32 background_map, scalar pre-filter noise_sigma).
+
+    On the whole image, clip each box-by-box cell with _clipped_stats and
+    interpolate its median to full resolution; extrapolate at image edges.
+    `box=64` controls this background grid, independently of Humza's filter tiles.
+    Estimate noise with the same clipping rule on float64(image) - background,
+    before filtering. Detection later compares the smoothed residual against
+    DetectionParams.threshold_sigma * noise_sigma (default multiplier: 3).
+
+    Both CPU backends use these definitions: ASTRO_BACKGROUND_BACKEND=numpy
+    (default) or cpp; ASTRO_BACKGROUND_THREADS controls native workers only.
+    There is currently no coverage mask: every finite pixel, including zero,
+    contributes. Repeated padding values can therefore bias the map and collapse
+    the noise estimate; a finite result alone does not validate a padded mosaic.
     """
     pixels = _image_pixels(img)
     if isinstance(box, (bool, np.bool_)) or not isinstance(box, (int, np.integer)) or box < 1:
@@ -97,5 +124,7 @@ def _estimate_background_numpy(pixels: np.ndarray, box: int) -> tuple[np.ndarray
     with np.errstate(over="raise", invalid="raise"):
         for y in range(height):
             background[y] = rows[y0[y]] * (1 - ty[y]) + rows[y1[y]] * ty[y]
+    # Preserve the reference arithmetic: widen before subtracting the float32
+    # map. This whole-image noise is measured before Gaussian smoothing.
     residual = pixels.astype(np.float64) - background
     return background, _clipped_stats(residual)[1]

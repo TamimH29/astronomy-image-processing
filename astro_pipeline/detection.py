@@ -24,8 +24,14 @@ def _validate_params(params: DetectionParams) -> None:
 
 def _measure_sources(tile: Tile, filtered: np.ndarray, noise_sigma: float,
                      params: DetectionParams) -> list[Source]:
+    # Source cutoff in background-subtracted pixel units. threshold_sigma is
+    # configurable (default 3.0 in interfaces.py::DetectionParams); noise_sigma
+    # comes from the UNFILTERED whole-image residual in process_image(). This is
+    # separate from the fixed +/- 3-sigma clipping used to estimate background.
     threshold = float(params.threshold_sigma) * noise_sigma
     if noise_sigma == 0:
+        # Numerical floor for truly noiseless inputs, not a recovered noise
+        # estimate. It cannot correct a MAD collapsed by no-coverage padding.
         threshold = 8 * np.finfo(np.float32).eps * float(np.max(np.abs(tile.data)))
     if not math.isfinite(threshold):
         raise ValueError("detection threshold must be finite")
@@ -103,6 +109,8 @@ def process_image(img: ImageData, params: DetectionParams,
             or not isinstance(tile_size, (int, np.integer)) or tile_size < 1):
         raise ValueError("tile_size must be a positive integer or None")
     tile_size = int(tile_size)
+    # Use the default 64-pixel background mesh before tiling or smoothing.
+    # params.threshold_sigma affects source selection below, not this estimate.
     level, noise = background.estimate_background(pixels)
     with np.errstate(over="raise", invalid="raise"):
         residual = pixels - level

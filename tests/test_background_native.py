@@ -1,12 +1,15 @@
 from concurrent.futures import ThreadPoolExecutor
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from scipy.optimize import linear_sum_assignment
+from scipy.spatial import cKDTree
 
 from astro_pipeline import background, detection, io_fits
-from astro_pipeline.interfaces import DetectionParams
+from astro_pipeline.interfaces import DetectionParams, ImageData
 
 
 @pytest.fixture(autouse=True)
@@ -225,3 +228,182 @@ def test_medium_fits_catalogs_match_numpy(native, monkeypatch, threads):
         monkeypatch.setenv("ASTRO_BACKGROUND_BACKEND", "cpp")
         monkeypatch.setenv("ASTRO_BACKGROUND_THREADS", str(threads))
         assert detection.process_image(image, params, 64) == expected
+
+
+@pytest.fixture(params=[("numpy", 1), ("cpp", 1), ("cpp", 2), ("cpp", 4)],
+                ids=["numpy", "cpp-1", "cpp-2", "cpp-4"])
+def accuracy_backend(request, monkeypatch):
+    backend, threads = request.param
+    if backend == "cpp":
+        request.getfixturevalue("native")
+    monkeypatch.setenv("ASTRO_BACKGROUND_BACKEND", backend)
+    monkeypatch.setenv("ASTRO_BACKGROUND_THREADS", str(threads))
+
+
+def _injected_sky(shape):
+    # Analytic truth from synthetic.py, independent of either estimator.
+    height, width = shape
+    yy, xx = np.mgrid[:height, :width]
+    return 100.0 + 8.0 * xx / max(width - 1, 1) + 5.0 * yy / max(height - 1, 1)
+
+
+def test_medium_fits_background_accuracy_against_injected_sky(accuracy_backend):
+    """Backend agreement alone cannot establish sky or noise accuracy."""
+    paths = sorted((Path(__file__).resolve().parents[1] / "gen_fits/medium").glob("*.fits"))
+    assert len(paths) == 10
+    for path in paths:
+        pixels = io_fits.read_fits(str(path)).data
+        truth = json.loads(path.with_suffix(".truth.json").read_text())["truth"]
+        sky = _injected_sky(pixels.shape)
+        clean = np.ones(pixels.shape, dtype=bool)
+        for source in truth:
+            radius = int(np.ceil(4 * source["sigma"]))
+            x, y = int(np.floor(source["x"])), int(np.floor(source["y"]))
+            clean[max(0, y-radius):y+radius+1, max(0, x-radius):x+radius+1] = False
+
+        level, noise = background.estimate_background(pixels)
+        rmse = float(np.sqrt(np.mean((level.astype(np.float64) - sky) ** 2)))
+        residual = pixels[clean].astype(np.float64) - level[clean]
+        assert rmse < 0.15, (path.name, rmse)
+        assert abs(noise - 2.0) < 0.1, (path.name, noise)
+        assert abs(float(np.median(residual))) < 0.1, path.name
+        assert abs(float(residual.std()) - 2.0) < 0.1, path.name
+
+
+def test_medium_fits_source_accuracy_against_injected_truth(accuracy_backend):
+    """Guard measured baseline accuracy, rather than only comparing backends.
+
+    These are regression limits for the current default settings, not final
+    project acceptance targets. Match one-to-one within three pixels, minimizing
+    distance after maximizing the number of valid pairs. Flux error compares
+    catalog flux with the full injected flux, including missed faint wings.
+    """
+    paths = sorted((Path(__file__).resolve().parents[1] / "gen_fits/medium").glob("*.fits"))
+    assert len(paths) == 10
+    truth_count, detected_count, matched_count = 0, 0, 0
+    position_errors, flux_errors = [], []
+    for path in paths:
+        truth = json.loads(path.with_suffix(".truth.json").read_text())["truth"]
+        image = io_fits.read_fits(str(path))
+        sources = detection.process_image(image, DetectionParams(), 64)
+        truth_count += len(truth)
+        detected_count += len(sources)
+        if not sources:
+            continue
+        measured = np.array([[source.x_centroid, source.y_centroid] for source in sources])
+        expected = np.array([[source["x"], source["y"]] for source in truth])
+        distances = np.linalg.norm(measured[:, None] - expected[None], axis=2)
+        ii, jj = linear_sum_assignment(np.where(distances <= 3, distances, 1e6))
+        for i, j in zip(ii, jj):
+            if distances[i, j] <= 3:
+                matched_count += 1
+                position_errors.append(float(distances[i, j]))
+                flux_errors.append(abs(sources[i].flux - truth[j]["flux"]) / truth[j]["flux"])
+
+    assert truth_count == 250
+    assert matched_count >= 230, matched_count
+    assert detected_count - matched_count <= 2, (detected_count, matched_count)
+    assert float(np.median(position_errors)) < 0.1
+    assert float(np.quantile(position_errors, 0.95)) < 0.3
+    assert float(np.median(flux_errors)) < 0.15
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError,
+                   reason="default 64-pixel mesh has one cell on a 64x64 gradient image")
+def test_tiny_fits_background_tracks_known_gradient(accuracy_backend):
+    path = Path(__file__).resolve().parents[1] / "gen_fits/tiny/tiny_000.fits"
+    pixels = io_fits.read_fits(str(path)).data
+    level, noise = background.estimate_background(pixels)
+    rmse = float(np.sqrt(np.mean((level.astype(np.float64) - _injected_sky(pixels.shape)) ** 2)))
+    assert rmse < 0.5, rmse
+    assert abs(noise - 2.0) < 0.1, noise
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError,
+                   reason="finite no-coverage fill pixels enter mesh statistics and interpolation")
+def test_known_sky_with_real_mosaic_coverage(accuracy_backend):
+    """Padding must not bias the known sky in the covered part of an image.
+
+    The shared zero footprint is used only as an explicit experimental coverage
+    mask; this test does not assert that zero-valued pixels are always invalid.
+    """
+    path = Path(__file__).resolve().parents[1] / "fits/255wmos.fits"
+    footprint = io_fits.read_fits(str(path)).data
+    yy = np.arange(256) * footprint.shape[0] // 256
+    xx = np.arange(256) * footprint.shape[1] // 256
+    valid = footprint[yy[:, None], xx[None, :]] != 0
+    sky = _injected_sky(valid.shape)
+    pixels = (sky + np.random.default_rng(37931).normal(0, 2, valid.shape)).astype(np.float32)
+    pixels[~valid] = 0
+    level, noise = background.estimate_background(pixels)
+    rmse = float(np.sqrt(np.mean((level[valid].astype(np.float64) - sky[valid]) ** 2)))
+    assert rmse < 0.5, rmse
+    assert abs(noise - 2.0) < 0.1, noise
+
+
+@pytest.mark.parametrize("filename", [
+    "Vcomb.fits", "green.fits",
+    pytest.param("255wmos.fits", marks=pytest.mark.xfail(
+        strict=True, raises=AssertionError,
+        reason="zero global MAD joins injected stars into large connected components")),
+    pytest.param("555wmos.fits", marks=pytest.mark.xfail(
+        strict=True, raises=AssertionError,
+        reason="underestimated global noise joins injected stars into large components")),
+])
+def test_real_fits_injected_star_recovery(native, monkeypatch, filename):
+    """Measure recovery of known added stars on genuine telescope pixels.
+
+    Place 60 sources away from baseline centroids and exact-zero pixels, at
+    peaks of 5/10/20 times a local adjacent-difference noise estimate. This is
+    an injection experiment, not an absolute noise calibration of real data.
+    Guard recovery and measurements of the strongest 20 additions; limits are
+    baseline regression guards, not final project acceptance targets.
+    """
+    monkeypatch.setenv("ASTRO_BACKGROUND_BACKEND", "cpp")
+    monkeypatch.setenv("ASTRO_BACKGROUND_THREADS", "4")
+    path = Path(__file__).resolve().parents[1] / "fits" / filename
+    image = io_fits.read_fits(str(path))
+    baseline = detection.process_image(image, DetectionParams(), 256)
+    tree = cKDTree([[s.x_centroid, s.y_centroid] for s in baseline]) if baseline else None
+    rng = np.random.default_rng(37931)
+    height, width = image.data.shape
+    pixels = image.data.copy()
+    truth = []
+    for _ in range(50000):
+        if len(truth) == 60:
+            break
+        x, y = rng.uniform(40, width - 40), rng.uniform(40, height - 40)
+        if tree is not None and tree.query([x, y])[0] < 24:
+            continue
+        if any(np.hypot(x - t["x"], y - t["y"]) < 32 for t in truth):
+            continue
+        ix, iy = int(np.floor(x)), int(np.floor(y))
+        window = image.data[iy-25:iy+26, ix-25:ix+26].astype(np.float64)
+        if not np.isfinite(window).all() or (window == 0).any():
+            continue
+        delta = np.concatenate([np.diff(window, axis=0).ravel(),
+                                np.diff(window, axis=1).ravel()])
+        local_noise = float(1.4826 * np.median(abs(delta - np.median(delta))) / np.sqrt(2))
+        if local_noise <= 0:
+            continue
+        peak = (5, 10, 20)[len(truth) % 3]
+        yy, xx = np.mgrid[iy-6:iy+7, ix-6:ix+7]
+        model = peak * local_noise * np.exp(-((xx-x)**2 + (yy-y)**2) / (2 * 1.5**2))
+        pixels[iy-6:iy+7, ix-6:ix+7] += model.astype(np.float32)
+        truth.append(dict(x=x, y=y, flux=float(model.sum()), peak=peak))
+    if len(truth) != 60:
+        raise RuntimeError(f"could not place 60 separated test stars in {filename}")
+
+    sources = detection.process_image(ImageData(image.image_id, pixels, image.header),
+                                      DetectionParams(), 256)
+    assert sources, filename
+    measured = np.array([[s.x_centroid, s.y_centroid] for s in sources])
+    expected = np.array([[t["x"], t["y"]] for t in truth])
+    distances = np.linalg.norm(measured[:, None] - expected[None], axis=2)
+    ii, jj = linear_sum_assignment(np.where(distances <= 3, distances, 1e6))
+    strong = [(i, j) for i, j in zip(ii, jj)
+              if distances[i, j] <= 3 and truth[j]["peak"] == 20]
+    assert len(strong) >= 15, (filename, len(strong), "of 20 strong injected stars")
+    assert float(np.median([distances[i, j] for i, j in strong])) < 0.5
+    assert float(np.median([abs(sources[i].flux - truth[j]["flux"]) / truth[j]["flux"]
+                            for i, j in strong])) < 0.4
