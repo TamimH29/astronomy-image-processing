@@ -22,7 +22,7 @@ if(NOT pybind11_FOUND)
   find_package(pybind11 2.13 CONFIG REQUIRED HINTS "${pybind11_cmake_dir}")
 endif()
 
-pybind11_add_module(_background_native native/background.cpp native/background_bindings.cpp)
+pybind11_add_module(_background_native native/background.cpp native/image_ops.cpp native/background_bindings.cpp)
 target_link_libraries(_background_native PRIVATE Threads::Threads)
 target_compile_features(_background_native PRIVATE cxx_std_20)
 target_compile_options(_background_native PRIVATE

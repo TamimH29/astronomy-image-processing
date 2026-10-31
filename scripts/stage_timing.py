@@ -1,6 +1,6 @@
 """Oct 31: where does the time go?  (Person 2)
 
-Times each pipeline stage on the CPU, computes the filter's share of total
+Times CPU stages and the selected FFT filter, computes its share of total
 runtime, and prints the Amdahl bound on GPU speedup: 1 / (1 - f).
 
 Run from the repo root:
@@ -17,8 +17,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import glob
 import os
+import resource
 import statistics
 import sys
 import tempfile
@@ -31,6 +31,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from astro_pipeline import background, detection, filtering, tiling  # noqa: E402
+from astro_pipeline.parallel import run_batch  # noqa: E402
+from astro_pipeline.run_pipeline import collect_paths  # noqa: E402
 from astro_pipeline.interfaces import DetectionParams, ImageData  # noqa: E402
 
 # (module, attribute, stage label). These are called as module attributes
@@ -76,12 +78,12 @@ def write_synthetic_files(out_dir, n_images, shape, n_sources):
 
 
 # ------------------------------------------------------------------- reader
-def pick_reader(sample_path):
+def pick_reader(sample_path, mask_zero_border=False):
     """Use Person 1's read_fits if it works, else a plain astropy reader."""
     try:
         from astro_pipeline.io_fits import read_fits
-        read_fits(sample_path)
-        return "io_fits.read_fits", read_fits
+        read_fits(sample_path, mask_zero_border=mask_zero_border)
+        return "io_fits.read_fits", lambda path: read_fits(path, mask_zero_border=mask_zero_border)
     except (ImportError, NotImplementedError):
         pass
     from astropy.io import fits
@@ -106,6 +108,16 @@ def instrumented(acc):
             def wrapper(*a, **k):
                 t0 = time.perf_counter()
                 try:
+                    if label == "background":
+                        result = background.profile_background(*a, **k)
+                        for stage in ("mesh_ms", "interpolation_ms", "noise_ms", "source_mask_ms", "global_median_ms"):
+                            acc["background_" + stage[:-3]] += result["timings"][stage] / 1000
+                        return result["background"], result["noise"]
+                    if label == "detect":
+                        result = orig(*a, **k, profile=True)
+                        for stage in ("label_ms", "deblend_ms", "measurement_ms"):
+                            acc[stage[:-3]] += result["timings"][stage] / 1000
+                        return result["sources"]
                     return orig(*a, **k)
                 finally:
                     acc[label] += time.perf_counter() - t0
@@ -126,6 +138,12 @@ def time_read(paths, reader):
 
 
 def time_process(images, params, tile_size):
+    # Measure production execution separately: diagnostic array exports are not
+    # included in the reported unprofiled wall time.
+    started = time.perf_counter()
+    for image in images:
+        detection.process_image(image, params, tile_size)
+    unprofiled = time.perf_counter() - started
     acc = defaultdict(float)
     with instrumented(acc):
         t0 = time.perf_counter()
@@ -135,6 +153,10 @@ def time_process(images, params, tile_size):
     out = {k: acc[k] for _, _, k in STAGES}
     out["other"] = total - sum(out.values())
     out["total"] = total
+    out["unprofiled"] = unprofiled
+    for key, value in acc.items():
+        if key not in out:
+            out[key] = value
     return out
 
 
@@ -148,6 +170,11 @@ def report(label, io_secs, stages, n_images):
         print(f"{name:12s} {1000 * secs / n_images:10.1f} "
               f"{100 * secs / grand:13.1f}%")
     print(f"{'total':12s} {1000 * grand / n_images:10.1f} {100.0:13.1f}%")
+    print(f"unprofiled processing: {1000 * stages['unprofiled'] / n_images:.2f} ms/image")
+    print("sub-stages (ms/image; global median is a subset of background noise):")
+    for name in ("background_mesh", "background_interpolation", "background_noise", "background_global_median",
+                 "background_source_mask", "label", "deblend", "measurement"):
+        print(f"  {name:28s} {1000 * stages.get(name, 0) / n_images:10.2f}")
 
     f = stages["filter"] / grand
     print(f"\nfilter share f = {f:.3f}")
@@ -166,7 +193,7 @@ def parse_tile_sizes(items):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawTextHelpFormatter)
-    ap.add_argument("--input", help="directory of real FITS files (optional)")
+    ap.add_argument("--input", help="directory, FITS file, or glob of real inputs (optional)")
     ap.add_argument("--limit", type=int, default=10,
                     help="max real files to use with --input")
     ap.add_argument("--n-images", type=int, default=5)
@@ -177,15 +204,20 @@ def main():
     ap.add_argument("--tile-sizes", nargs="+", default=["none", "512", "1024"],
                     help='e.g. none 512 1024 ("none" = whole image)')
     ap.add_argument("--kernel-sigma", type=float, default=2.0)
+    ap.add_argument("--backend", choices=("cpu", "gpu"), default="cpu")
+    ap.add_argument("--mask-zero-border", action="store_true")
+    ap.add_argument("--no-background-refinement", action="store_true")
+    ap.add_argument("--no-deblend", action="store_true")
+    ap.add_argument("--workers", type=int, default=1, help="worker count for the separate FITS-to-sources batch wall time")
     args = ap.parse_args()
 
-    params = DetectionParams(kernel_sigma=args.kernel_sigma, backend="cpu")
+    params = DetectionParams(kernel_sigma=args.kernel_sigma, backend=args.backend,
+                             refine_background=not args.no_background_refinement,
+                             deblend=not args.no_deblend)
 
     with tempfile.TemporaryDirectory() as tmp:
         if args.input:
-            paths = sorted(p for pat in ("*.fits", "*.fits.gz", "*.fits.bz2",
-                                         "*.fit")
-                           for p in glob.glob(os.path.join(args.input, pat)))
+            paths = collect_paths(args.input)
             paths = paths[:args.limit]
             if not paths:
                 raise SystemExit(f"no FITS files in {args.input!r}")
@@ -195,10 +227,14 @@ def main():
                                           tuple(args.shape), args.n_sources)
             source = f"{len(paths)} generated images, shape {tuple(args.shape)}"
 
-        reader_name, reader = pick_reader(paths[0])
+        reader_name, reader = pick_reader(paths[0], args.mask_zero_border)
         print(f"data:   {source}")
         print(f"reader: {reader_name}")
         print(f"cpus:   {os.cpu_count()}   repeats: {args.repeats} (median)")
+        print(f"filter: {args.backend}; background: {os.environ.get('ASTRO_BACKGROUND_BACKEND', 'numpy')} "
+              f"({os.environ.get('ASTRO_BACKGROUND_THREADS', '1')} threads); detection: "
+              f"{os.environ.get('ASTRO_DETECTION_BACKEND', 'python')} "
+              f"({os.environ.get('ASTRO_DETECTION_THREADS', '1')} threads)")
 
         time_read(paths, reader)                      # warm the file cache
         io_runs, images = [], None
@@ -215,8 +251,21 @@ def main():
             med = {k: statistics.median(r[k] for r in runs) for k in runs[0]}
             report("none (whole image)" if tile_size is None else tile_size,
                    io_secs, med, len(images))
+            batch = []
+            for _ in range(args.repeats):
+                started = time.perf_counter()
+                run_batch(paths, params, args.workers, tile_size, mask_zero_border=args.mask_zero_border)
+                batch.append(time.perf_counter() - started)
+            print(f"FITS-to-sources batch wall time ({args.workers} workers, includes I/O and pool startup): "
+                  f"{statistics.median(batch):.3f} s")
 
-    print("\nNotes: CPU backend only. The OS file cache is warm, so I/O is a "
+    print(f"process peak RSS: {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024:.1f} MiB "
+          "(includes resident inputs and profiling buffers)")
+    if args.workers > 1:
+        print(f"largest child peak RSS: {resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024:.1f} MiB "
+              "(not aggregate worker memory)")
+
+    print("\nNotes: The OS file cache is warm, so I/O is a "
           "lower bound;\nreal SDSS .bz2 files add decompression time. "
           "Re-run on a TACC CPU node for final numbers.")
 

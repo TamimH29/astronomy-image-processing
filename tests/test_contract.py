@@ -191,9 +191,9 @@ def test_process_image_calls_real_humza_functions_and_preserves_inputs(monkeypat
     calls = {"background": 0, "filter": 0, "measure": 0, "merge": 0}
     recorded = {}
 
-    def estimate(data, box=64):
+    def estimate(data, box=64, **kwargs):
         calls["background"] += 1
-        result = real_background(data, box)
+        result = real_background(data, box, **kwargs)
         recorded["noise"] = result[1]
         return result
 
@@ -207,11 +207,11 @@ def test_process_image_calls_real_humza_functions_and_preserves_inputs(monkeypat
         calls["filter"] += 1
         return real_smooth(data, sigma, backend)
 
-    def measure(tile, filtered, noise, config):
+    def measure(tile, filtered, noise, config, **kwargs):
         calls["measure"] += 1
         assert tile.data.shape == image.data.shape == filtered.shape
         assert noise == recorded["noise"]
-        return real_measure(tile, filtered, noise, config)
+        return real_measure(tile, filtered, noise, config, **kwargs)
 
     def merge(image_id, per_tile, tile_list):
         calls["merge"] += 1
@@ -230,7 +230,7 @@ def test_process_image_calls_real_humza_functions_and_preserves_inputs(monkeypat
     monkeypatch.setattr(filtering, "smooth", smooth)
     monkeypatch.setattr(detection, "_measure_sources", measure)
     sources = detection.process_image(image, params, 64)
-    assert calls == {"background": 1, "filter": recorded["tile_count"], "measure": 1, "merge": 1}
+    assert calls == {"background": 1, "filter": 2 * recorded["tile_count"], "measure": 1, "merge": 1}
     assert [s.source_id for s in sources] == [1, 2, 3, 4]
     np.testing.assert_array_equal(image.data, original)
     assert image.header == {"BUNIT": "counts"}

@@ -17,13 +17,14 @@ _THREAD_VARS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                 "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS")
 
 
-def _process_one(path: str, params: DetectionParams, tile_size: int | None
+def _process_one(path: str, params: DetectionParams, tile_size: int | None,
+                 mask_zero_border: bool = False
                  ) -> tuple[str, list[Source]]:
     """Top-level (picklable) unit of work: read one file, run the reference
     pipeline on it. CuPy is imported lazily inside filtering._smooth_gpu, so
     with backend="gpu" it is first imported inside the worker, not the parent.
     """
-    image = io_fits.read_fits(path)
+    image = io_fits.read_fits(path, mask_zero_border=mask_zero_border)
     return image.image_id, detection.process_image(image, params, tile_size)
 
 
@@ -66,7 +67,7 @@ def _record(results: dict, origin: dict, image_id: str,
 
 
 def run_batch(paths: Sequence[str], params: DetectionParams,
-              n_workers: int, tile_size: int | None = None
+              n_workers: int, tile_size: int | None = None, *, mask_zero_border: bool = False
               ) -> dict[str, list[Source]]:
     """Process many images with a ProcessPoolExecutor (not threads: the GIL
     limits CPU-bound threads). tile_size=None means whole-image parallelism
@@ -100,7 +101,7 @@ def run_batch(paths: Sequence[str], params: DetectionParams,
     if workers == 1:
         for path in paths:
             try:
-                image_id, sources = _process_one(path, params, tile_size)
+                image_id, sources = _process_one(path, params, tile_size, mask_zero_border)
             except Exception as error:
                 raise _failure(path, error) from error
             _record(results, origin, image_id, sources, path)
@@ -108,7 +109,7 @@ def run_batch(paths: Sequence[str], params: DetectionParams,
         with _single_threaded_env(), ProcessPoolExecutor(
                 max_workers=workers,
                 mp_context=mp.get_context("spawn")) as pool:
-            futures = {pool.submit(_process_one, p, params, tile_size): p
+            futures = {pool.submit(_process_one, p, params, tile_size, mask_zero_border): p
                        for p in paths}
             try:
                 for future in as_completed(futures):

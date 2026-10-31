@@ -51,7 +51,7 @@ def _smooth_gpu(data: np.ndarray, kernel_sigma: float) -> np.ndarray:
     except ImportError as error:
         raise ImportError(
             "backend='gpu' requires a working CuPy installation matching the "
-            "node's CUDA runtime; see docs/filtering.md"
+            "node's CUDA runtime"
         ) from error
 
     device_pixels = cp.asarray(pixels)
@@ -65,15 +65,28 @@ def _smooth_gpu(data: np.ndarray, kernel_sigma: float) -> np.ndarray:
     return result
 
 
-def smooth(data: np.ndarray, kernel_sigma: float, backend: str = "cpu"
+def smooth(data: np.ndarray, kernel_sigma: float, backend: str = "cpu", *,
+           valid_mask: np.ndarray | None = None
            ) -> np.ndarray:
     """Return an independent float32 image using the shared backend names.
 
     Inputs must be finite and nonempty. Both backends use radius ceil(4*sigma)
     and reflected edges. GPU errors propagate; there is no CPU fallback.
     """
-    if backend == "cpu":
-        return _smooth_cpu(data, kernel_sigma)
-    if backend == "gpu":
-        return _smooth_gpu(data, kernel_sigma)
-    raise ValueError(f"unknown backend {backend!r}")
+    if backend not in ("cpu", "gpu"):
+        raise ValueError(f"unknown backend {backend!r}")
+    operation = _smooth_cpu if backend == "cpu" else _smooth_gpu
+    if valid_mask is None:
+        return operation(data, kernel_sigma)
+    mask = np.asarray(valid_mask)
+    if mask.dtype != np.bool_ or mask.shape != np.shape(data):
+        raise ValueError("valid_mask must be a boolean array with the image shape")
+    if mask.all():
+        return operation(data, kernel_sigma)
+    # Missing data do not count as zero observations. The denominator measures
+    # the observed Gaussian weight; reject poorly supported centers, not stars.
+    numerator = operation(np.where(mask, data, 0), kernel_sigma)
+    denominator = operation(mask.astype(np.float32), kernel_sigma)
+    result = np.zeros_like(numerator)
+    np.divide(numerator, denominator, out=result, where=mask & (denominator >= 0.5))
+    return result

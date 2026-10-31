@@ -17,6 +17,9 @@ def make_tiles(img: ImageData, tile_size: int, halo: int) -> list[Tile]:
     if tile_size < 1 or halo < 0:
         raise ValueError("need tile_size >= 1 and halo >= 0")
     H, W = data.shape
+    mask = None if img.valid_mask is None else np.asarray(img.valid_mask)
+    if mask is not None and (mask.shape != data.shape or mask.dtype != np.bool_):
+        raise ValueError("valid_mask must be a boolean array with the image shape")
 
     tiles = []
     for cy0 in range(0, H, tile_size):                 # row-major order
@@ -33,6 +36,7 @@ def make_tiles(img: ImageData, tile_size: int, halo: int) -> list[Tile]:
                 data=np.array(data[y0:y1, x0:x1], dtype=np.float32, order="C"),
                 core=(cy0, cx0, cy1, cx1),
                 halo=halo,
+                valid_mask=None if mask is None else mask[y0:y1, x0:x1].copy(),
             ))
     return tiles
 

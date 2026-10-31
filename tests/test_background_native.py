@@ -6,7 +6,6 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from scipy.optimize import linear_sum_assignment
-from scipy.spatial import cKDTree
 
 from astro_pipeline import background, detection, io_fits
 from astro_pipeline.interfaces import DetectionParams, ImageData
@@ -16,12 +15,16 @@ from astro_pipeline.interfaces import DetectionParams, ImageData
 def default_backend(monkeypatch):
     monkeypatch.delenv("ASTRO_BACKGROUND_BACKEND", raising=False)
     monkeypatch.delenv("ASTRO_BACKGROUND_THREADS", raising=False)
+    monkeypatch.delenv("ASTRO_DETECTION_BACKEND", raising=False)
+    monkeypatch.delenv("ASTRO_DETECTION_THREADS", raising=False)
 
 
 @pytest.fixture
 def native():
-    return pytest.importorskip("astro_pipeline._background_native",
-                               reason="native background extension is not built")
+    module = pytest.importorskip("astro_pipeline._background_native",
+                                reason="native background extension is not built")
+    assert getattr(module, "API_VERSION", 0) == 2, "rebuild the stale native CPU extension"
+    return module
 
 
 @pytest.mark.parametrize("shape,box", [((1, 1), 1), ((1, 17), 4), ((13, 1), 4),
@@ -126,10 +129,10 @@ def test_numpy_is_default_and_does_not_import_native(monkeypatch):
 
 def test_cpp_dispatch_defaults_to_one_thread_per_process(monkeypatch):
     calls = []
-    def estimate(data, box, threads):
+    def estimate(data, box, threads, **kwargs):
         calls.append((box, threads))
         return np.zeros_like(data), 0.0
-    monkeypatch.setattr(background, "import_module", lambda name: SimpleNamespace(estimate_background=estimate))
+    monkeypatch.setattr(background, "import_module", lambda name: SimpleNamespace(API_VERSION=2, estimate_background=estimate))
     monkeypatch.setenv("ASTRO_BACKGROUND_BACKEND", "cpp")
     background.estimate_background(np.ones((9, 13), np.float32))
     assert calls == [(64, 1)]
@@ -149,10 +152,10 @@ def test_explicit_cpp_request_never_silently_falls_back(monkeypatch):
 
 def test_cpp_dispatch_respects_process_cpu_affinity(monkeypatch):
     calls = []
-    def estimate(data, box, threads):
+    def estimate(data, box, threads, **kwargs):
         calls.append(threads)
         return np.zeros_like(data), 0.0
-    monkeypatch.setattr(background, "import_module", lambda name: SimpleNamespace(estimate_background=estimate))
+    monkeypatch.setattr(background, "import_module", lambda name: SimpleNamespace(API_VERSION=2, estimate_background=estimate))
     monkeypatch.setattr(background.os, "sched_getaffinity", lambda pid: {0, 1})
     monkeypatch.setenv("ASTRO_BACKGROUND_BACKEND", "cpp")
     monkeypatch.setenv("ASTRO_BACKGROUND_THREADS", "100000000000000000000")
@@ -319,8 +322,6 @@ def test_tiny_fits_background_tracks_known_gradient(accuracy_backend):
     assert abs(noise - 2.0) < 0.1, noise
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError,
-                   reason="finite no-coverage fill pixels enter mesh statistics and interpolation")
 def test_known_sky_with_real_mosaic_coverage(accuracy_backend):
     """Padding must not bias the known sky in the covered part of an image.
 
@@ -335,75 +336,59 @@ def test_known_sky_with_real_mosaic_coverage(accuracy_backend):
     sky = _injected_sky(valid.shape)
     pixels = (sky + np.random.default_rng(37931).normal(0, 2, valid.shape)).astype(np.float32)
     pixels[~valid] = 0
-    level, noise = background.estimate_background(pixels)
+    level, noise = background.estimate_background(pixels, valid_mask=valid)
     rmse = float(np.sqrt(np.mean((level[valid].astype(np.float64) - sky[valid]) ** 2)))
     assert rmse < 0.5, rmse
     assert abs(noise - 2.0) < 0.1, noise
 
 
-@pytest.mark.parametrize("filename", [
-    "Vcomb.fits", "green.fits",
-    pytest.param("255wmos.fits", marks=pytest.mark.xfail(
-        strict=True, raises=AssertionError,
-        reason="zero global MAD joins injected stars into large connected components")),
-    pytest.param("555wmos.fits", marks=pytest.mark.xfail(
-        strict=True, raises=AssertionError,
-        reason="underestimated global noise joins injected stars into large components")),
-])
-def test_real_fits_injected_star_recovery(native, monkeypatch, filename):
-    """Measure recovery of known added stars on genuine telescope pixels.
+@pytest.mark.parametrize("background_backend,detector_backend", [
+    ("numpy", "python"), ("cpp", "python"), ("numpy", "cpp"), ("cpp", "cpp")])
+@pytest.mark.parametrize("filename,required", [("Vcomb.fits", 20), ("green.fits", 19),
+                                               ("255wmos.fits", 20), ("555wmos.fits", 20)])
+def test_real_fits_injected_star_recovery(request, monkeypatch, filename, required,
+                                         background_backend, detector_backend):
+    """Frozen additions: the five diagnosed mosaic failures must all recover.
 
-    Place 60 sources away from baseline centroids and exact-zero pixels, at
-    peaks of 5/10/20 times a local adjacent-difference noise estimate. This is
-    an injection experiment, not an absolute noise calibration of real data.
-    Guard recovery and measurements of the strongest 20 additions; limits are
-    baseline regression guards, not final project acceptance targets.
+    The peak ratio is based on neighboring-pixel differences, not calibrated
+    global detection significance. The separate isolated control requires 20/20.
     """
-    monkeypatch.setenv("ASTRO_BACKGROUND_BACKEND", "cpp")
+    if "cpp" in (background_backend, detector_backend):
+        request.getfixturevalue("native")
+    monkeypatch.setenv("ASTRO_BACKGROUND_BACKEND", background_backend)
+    monkeypatch.setenv("ASTRO_DETECTION_BACKEND", detector_backend)
     monkeypatch.setenv("ASTRO_BACKGROUND_THREADS", "4")
-    path = Path(__file__).resolve().parents[1] / "fits" / filename
-    image = io_fits.read_fits(str(path))
-    baseline = detection.process_image(image, DetectionParams(), 256)
-    tree = cKDTree([[s.x_centroid, s.y_centroid] for s in baseline]) if baseline else None
-    rng = np.random.default_rng(37931)
-    height, width = image.data.shape
+    monkeypatch.setenv("ASTRO_DETECTION_THREADS", "4")
+    fixture = Path(__file__).parent / "fixtures/real_star_injections.json"
+    truth = json.loads(fixture.read_text())[filename]
+    image = io_fits.read_fits(str(Path(__file__).resolve().parents[1] / "fits" / filename),
+                             mask_zero_border=filename in ("255wmos.fits", "555wmos.fits"))
     pixels = image.data.copy()
-    truth = []
-    for _ in range(50000):
-        if len(truth) == 60:
-            break
-        x, y = rng.uniform(40, width - 40), rng.uniform(40, height - 40)
-        if tree is not None and tree.query([x, y])[0] < 24:
-            continue
-        if any(np.hypot(x - t["x"], y - t["y"]) < 32 for t in truth):
-            continue
+    for source in truth:
+        x, y = source["x"], source["y"]
         ix, iy = int(np.floor(x)), int(np.floor(y))
-        window = image.data[iy-25:iy+26, ix-25:ix+26].astype(np.float64)
-        if not np.isfinite(window).all() or (window == 0).any():
-            continue
-        delta = np.concatenate([np.diff(window, axis=0).ravel(),
-                                np.diff(window, axis=1).ravel()])
-        local_noise = float(1.4826 * np.median(abs(delta - np.median(delta))) / np.sqrt(2))
-        if local_noise <= 0:
-            continue
-        peak = (5, 10, 20)[len(truth) % 3]
         yy, xx = np.mgrid[iy-6:iy+7, ix-6:ix+7]
-        model = peak * local_noise * np.exp(-((xx-x)**2 + (yy-y)**2) / (2 * 1.5**2))
+        model = np.exp(-((xx-x)**2 + (yy-y)**2) / (2 * 1.5**2))
+        model *= source["flux"] / model.sum()
         pixels[iy-6:iy+7, ix-6:ix+7] += model.astype(np.float32)
-        truth.append(dict(x=x, y=y, flux=float(model.sum()), peak=peak))
-    if len(truth) != 60:
-        raise RuntimeError(f"could not place 60 separated test stars in {filename}")
-
-    sources = detection.process_image(ImageData(image.image_id, pixels, image.header),
+    sources = detection.process_image(ImageData(image.image_id, pixels, image.header, image.valid_mask),
                                       DetectionParams(), 256)
-    assert sources, filename
-    measured = np.array([[s.x_centroid, s.y_centroid] for s in sources])
-    expected = np.array([[t["x"], t["y"]] for t in truth])
+    measured = np.array([[source.x_centroid, source.y_centroid] for source in sources])
+    expected = np.array([[source["x"], source["y"]] for source in truth])
     distances = np.linalg.norm(measured[:, None] - expected[None], axis=2)
     ii, jj = linear_sum_assignment(np.where(distances <= 3, distances, 1e6))
     strong = [(i, j) for i, j in zip(ii, jj)
-              if distances[i, j] <= 3 and truth[j]["peak"] == 20]
-    assert len(strong) >= 15, (filename, len(strong), "of 20 strong injected stars")
+              if distances[i, j] <= 3 and truth[j]["peak_local_noise_units"] == 20]
+    assert len(strong) >= required, (filename, len(strong))
     assert float(np.median([distances[i, j] for i, j in strong])) < 0.5
     assert float(np.median([abs(sources[i].flux - truth[j]["flux"]) / truth[j]["flux"]
                             for i, j in strong])) < 0.4
+    if filename == "green.fits":
+        # This remaining addition has fewer than min_area pixels above the
+        # unchanged global cutoff. Its neighbor-difference peak ratio is not
+        # the significance used by the detector; it is not a deblending miss.
+        from astro_pipeline import filtering
+        level, noise = background.estimate_background(pixels)
+        filtered = filtering.smooth(pixels - level, 2)
+        x, y = int(truth[8]["x"]), int(truth[8]["y"])
+        assert np.count_nonzero(filtered[y-4:y+5, x-4:x+5] > 3 * noise) < 5
