@@ -51,12 +51,11 @@ Stats clipped_stats(Workspace& data, Executor& executor, double* selection_ms = 
     data.counts.resize(executor.size());
     data.offsets.resize(executor.size());
     auto summarize = [&] {
+        // Samples are private to this call and only their multiset matters.
+        // Select the exact center in place instead of copying the whole image
+        // before every clipping pass. Caller-owned image pixels are untouched.
+        const auto center = median(data.samples, selection_ms);
         data.scratch.resize(data.samples.size());
-        executor.run(data.samples.size(), [&](auto, auto begin, auto end) {
-            std::copy(data.samples.begin() + begin, data.samples.begin() + end,
-                      data.scratch.begin() + begin);
-        });
-        const auto center = median(data.scratch, selection_ms);
         executor.run(data.samples.size(), [&](auto, auto begin, auto end) {
             for (auto i = begin; i < end; ++i)
                 data.scratch[i] = std::abs(data.samples[i] - center);
@@ -70,10 +69,13 @@ Stats clipped_stats(Workspace& data, Executor& executor, double* selection_ms = 
         if (stats.noise == 0) return stats;
         const double limit = 3 * stats.noise; // Background clipping, not source detection.
         executor.run(data.samples.size(), [&](auto worker, auto begin, auto end) {
-            std::size_t kept = 0;
-            for (auto i = begin; i < end; ++i)
-                kept += std::abs(data.samples[i] - stats.center) <= limit;
-            data.counts[worker] = kept;
+            // Compact each disjoint worker range while counting it. Evaluate
+            // the clipping predicate once, then join the retained ranges with
+            // contiguous copies rather than testing every sample a second time.
+            const auto first = data.samples.begin() + begin;
+            const auto retained = std::remove_if(first, data.samples.begin() + end,
+                [&](double value) { return std::abs(value - stats.center) > limit; });
+            data.counts[worker] = static_cast<std::size_t>(retained - first);
         });
         std::size_t kept = 0;
         for (std::size_t i = 0; i < executor.size(); ++i) {
@@ -81,12 +83,16 @@ Stats clipped_stats(Workspace& data, Executor& executor, double* selection_ms = 
             kept += data.counts[i];
         }
         if (kept == data.samples.size()) return stats;
+        if (executor.size() == 1) {
+            // Mesh statistics and one-thread global statistics are already
+            // compact: no second buffer or merge pass is needed.
+            data.samples.resize(kept);
+            continue;
+        }
         data.compacted.resize(kept);
-        executor.run(data.samples.size(), [&](auto worker, auto begin, auto end) {
-            auto output = data.offsets[worker];
-            for (auto i = begin; i < end; ++i)
-                if (std::abs(data.samples[i] - stats.center) <= limit)
-                    data.compacted[output++] = data.samples[i];
+        executor.run(data.samples.size(), [&](auto worker, auto begin, auto) {
+            std::copy_n(data.samples.begin() + begin, data.counts[worker],
+                        data.compacted.begin() + data.offsets[worker]);
         });
         data.samples.swap(data.compacted);
     }
