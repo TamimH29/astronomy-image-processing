@@ -1,9 +1,11 @@
 """Person 1: FITS ingestion and catalog output."""
 from __future__ import annotations
+import csv
 from pathlib import Path
 from typing import Iterable
 import numpy as np
 from astropy.io import fits
+from astropy.table import Table
 from .interfaces import ImageData, Source, CATALOG_COLUMNS  # noqa: F401
 
 
@@ -59,4 +61,35 @@ def write_catalog(sources: Iterable[Source], path: str) -> None:
     """Write CATALOG_COLUMNS to CSV (or a FITS table if path ends in .fits).
     Rows sorted by (image_id, source_id) so output is deterministic.
     """
-    raise NotImplementedError
+    output_path = Path(path)
+    ordered_sources = sorted(
+        sources,
+        key=lambda source: (source.image_id, source.source_id),
+    )
+    rows = [source.as_row() for source in ordered_sources]
+
+    if output_path.suffix.lower() == ".fits":
+        image_id_width = max(
+            (len(source.image_id) for source in ordered_sources),
+            default=1,
+        )
+        column_dtypes = [
+            f"U{image_id_width}",
+            np.int64,
+            np.float64,
+            np.float64,
+            np.int64,
+            np.int64,
+            np.int64,
+            np.int64,
+            np.int64,
+            np.float64,
+        ]
+        table = Table(rows=rows, names=CATALOG_COLUMNS, dtype=column_dtypes)
+        table.write(output_path, format="fits", overwrite=True)
+        return
+
+    with output_path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream, lineterminator="\n")
+        writer.writerow(CATALOG_COLUMNS)
+        writer.writerows(rows)
