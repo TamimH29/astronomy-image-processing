@@ -35,6 +35,11 @@ def main(argv=None) -> None:
     ap.add_argument("--kernel-sigma", type=float, default=2.0)
     ap.add_argument("--threshold-sigma", type=float, default=3.0)
     ap.add_argument("--min-area", type=int, default=5)
+    ap.add_argument("--mask-zero-border", action="store_true", help="declare border-connected zeros to be missing coverage")
+    ap.add_argument("--no-background-refinement", action="store_true", help="disable iterative source exclusion for comparisons")
+    ap.add_argument("--no-deblend", action="store_true", help="keep one source per connected component")
+    ap.add_argument("--deblend-min-separation", type=int, default=3, help="minimum distance between peak markers in pixels")
+    ap.add_argument("--deblend-prominence-sigma", type=float, default=1.0, help="minimum peak-to-saddle height in pre-filter noise units")
     ap.add_argument("--benchmark", action="store_true",
                     help="print per-stage timings instead of writing a catalog")
     args = ap.parse_args(argv)
@@ -44,14 +49,19 @@ def main(argv=None) -> None:
         raise SystemExit(f"no FITS files found for {args.input!r}")
     params = DetectionParams(kernel_sigma=args.kernel_sigma,
                              threshold_sigma=args.threshold_sigma,
-                             min_area=args.min_area, backend=args.backend)
+                             min_area=args.min_area, backend=args.backend,
+                             refine_background=not args.no_background_refinement,
+                             deblend=not args.no_deblend,
+                             deblend_min_separation=args.deblend_min_separation,
+                             deblend_prominence_sigma=args.deblend_prominence_sigma)
 
     if args.benchmark:
         for stage, secs in benchmark(paths, params, args.workers).items():
             print(f"{stage:12s} {secs:10.3f} s")
         return
 
-    results = run_batch(paths, params, args.workers, args.tile_size)
+    results = run_batch(paths, params, args.workers, args.tile_size,
+                        mask_zero_border=args.mask_zero_border)
     all_sources = [s for image_id in sorted(results) for s in results[image_id]]
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     write_catalog(all_sources, args.output)

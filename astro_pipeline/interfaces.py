@@ -28,13 +28,16 @@ CONVENTIONS (read these first)
   * A source is "owned" by the tile whose CORE region contains its centroid.
     merge() keeps only owned sources, which prevents duplicates at tile edges.
   * halo >= ceil(4 * kernel_sigma) so filtering of the core is exact.
+  * valid_mask=None means all observations are valid. False pixels have finite
+    fillers, contribute no statistics/measurements, and retain their mask in halos.
+    Internal source-exclusion masks affect background fitting only.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
 import numpy as np
 
-INTERFACE_VERSION = 2
+INTERFACE_VERSION = 3
 
 # Fixed catalog schema (column order matters for CSV output).
 CATALOG_COLUMNS = [
@@ -51,6 +54,7 @@ class ImageData:
     image_id: str                     # e.g. file stem
     data: np.ndarray                  # 2D float32
     header: dict = field(default_factory=dict)
+    valid_mask: np.ndarray | None = None  # True = observed; None = all valid
 
 
 @dataclass
@@ -62,6 +66,7 @@ class Tile:
     core: tuple[int, int, int, int]   # (cy0, cx0, cy1, cx1) owned region, image
                                       # coords, half-open [cy0, cy1) x [cx0, cx1)
     halo: int
+    valid_mask: np.ndarray | None = None  # includes the same halo as data
 
 
 @dataclass
@@ -88,3 +93,7 @@ class DetectionParams:
     threshold_sigma: float = 3.0      # k in "k * noise above background"
     min_area: int = 5                 # reject smaller blobs
     backend: str = "cpu"              # "cpu" (SciPy) or "gpu" (CuPy)
+    refine_background: bool = True
+    deblend: bool = True
+    deblend_min_separation: int = 3    # pixels between retained peak markers
+    deblend_prominence_sigma: float = 1.0  # peak-to-saddle height / pre-filter noise

@@ -9,9 +9,9 @@ from astropy.table import Table
 from .interfaces import ImageData, Source, CATALOG_COLUMNS  # noqa: F401
 
 
-def read_fits(path: str) -> ImageData:
+def read_fits(path: str, *, mask_zero_border: bool = False) -> ImageData:
     """Read the first image HDU (handle .fits.gz / .fits.bz2 and extension
-    HDUs). Return float32 data. Replace NaN/inf with the image median.
+    HDUs). Return float32 data and preserve invalidity before filling NaN/inf.
     image_id = file stem.
 
     The image_id is the filename stem with optional FITS compression and
@@ -28,6 +28,7 @@ def read_fits(path: str) -> ImageData:
 
     image = None
     header: dict = {}
+    unsupported_shapes = []
     with fits.open(fits_path, memmap=False) as hdus:
         for hdu in hdus:
             if not isinstance(
@@ -36,25 +37,42 @@ def read_fits(path: str) -> ImageData:
             ):
                 continue
             hdu_data = hdu.data
-            if hdu_data is None or hdu_data.ndim != 2 or hdu_data.size == 0:
+            if hdu_data is None or hdu_data.size == 0:
+                continue
+            if hdu_data.ndim != 2:
+                unsupported_shapes.append(hdu_data.shape)
                 continue
 
             # Copy out of the HDU before its file is closed. Astropy applies
             # FITS scaling (BSCALE/BZERO) when accessing hdu.data.
             image = np.array(hdu_data, dtype=np.float32, copy=True)
+            # Repair fixable metadata in memory, retaining Astropy's warnings.
+            # Opening readonly and never flushing leaves the source file intact.
+            hdu.verify("fix")
             header = dict(hdu.header)
             break
 
     if image is None:
-        raise ValueError(f"No non-empty 2D image HDU found in {fits_path}")
+        detail = f"; unsupported image shapes {unsupported_shapes}; cubes require explicit 2D selection" if unsupported_shapes else ""
+        raise ValueError(f"No non-empty 2D image HDU found in {fits_path}{detail}")
 
     finite = np.isfinite(image)
     if not finite.any():
         raise ValueError(f"Image HDU in {fits_path} contains no finite pixels")
-    if not finite.all():
-        image[~finite] = np.median(image[finite])
+    if mask_zero_border:
+        from scipy.ndimage import binary_propagation
+        zero = image == 0
+        seed = np.zeros_like(zero)
+        seed[0], seed[-1] = zero[0], zero[-1]
+        seed[:, 0], seed[:, -1] = zero[:, 0], zero[:, -1]
+        # Default cross connectivity is four-neighbor connectivity.
+        finite &= ~binary_propagation(seed, mask=zero)
+    if not finite.any():
+        raise ValueError(f"Image HDU in {fits_path} contains no usable observations")
+    image[~finite] = 0
 
-    return ImageData(image_id=image_id, data=image, header=header)
+    return ImageData(image_id=image_id, data=image, header=header,
+                     valid_mask=None if finite.all() else finite)
 
 
 def write_catalog(sources: Iterable[Source], path: str) -> None:
