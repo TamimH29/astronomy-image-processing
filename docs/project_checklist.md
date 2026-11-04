@@ -37,7 +37,7 @@ The project now reports **speedup by stage** and compares **three tiers**: (1) o
 ### New shared items
 - [ ] **[NEW]** (Oct 30) Agree on the benchmark design: the three tiers, which node type is used for tiers 2 and 3 (same node type for both), and that each measurement is repeated and the median reported
 - [ ] **[NEW]** (Oct 31) Agree what "CPU-only version" means in the report (one core, all cores, or both) and tell the instructor/TA that the performance goal is being reframed from a pass/fail 2x to a per-stage characterization
-- [ ] **[NEW]** (Oct 30) Update `interfaces.py` to `INTERFACE_VERSION = 3` with the expanded benchmark keys (see Person 2)
+- [ ] **[NEW]** (Oct 30; version target updated Nov 4) Update `interfaces.py` to `INTERFACE_VERSION = 4` with the expanded benchmark keys and three-tier timing result types (see Person 2)
 
 ## Person 1: ingestion, data, validation
 - [ ] (Oct 20-22) `make_synthetic_image` + FITS output + truth table
