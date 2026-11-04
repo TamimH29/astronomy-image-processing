@@ -38,7 +38,7 @@ def cpu_backends(request, monkeypatch):
 
 
 def test_mask_contract_is_appended_and_tiles_preserve_it():
-    assert INTERFACE_VERSION == 3
+    assert INTERFACE_VERSION == 4
     pixels = np.ones((17, 23), np.float32)
     valid = pixels.astype(bool)
     valid[7:12, 8:13] = False

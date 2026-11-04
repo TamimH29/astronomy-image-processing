@@ -9,7 +9,7 @@ import argparse
 import glob
 import os
 
-from .interfaces import DetectionParams
+from .interfaces import BENCHMARK_TIMING_KEYS, DetectionParams
 from .io_fits import write_catalog
 from .parallel import run_batch
 from .benchmark import benchmark
@@ -42,6 +42,8 @@ def main(argv=None) -> None:
     ap.add_argument("--deblend-prominence-sigma", type=float, default=1.0, help="minimum peak-to-saddle height in pre-filter noise units")
     ap.add_argument("--benchmark", action="store_true",
                     help="print per-stage timings instead of writing a catalog")
+    ap.add_argument("--benchmark-repeats", type=int, default=3,
+                    help="number of timing runs used for the reported median")
     args = ap.parse_args(argv)
 
     paths = collect_paths(args.input)
@@ -56,8 +58,17 @@ def main(argv=None) -> None:
                              deblend_prominence_sigma=args.deblend_prominence_sigma)
 
     if args.benchmark:
-        for stage, secs in benchmark(paths, params, args.workers).items():
-            print(f"{stage:12s} {secs:10.3f} s")
+        timings = benchmark(
+            paths,
+            params,
+            args.workers,
+            tile_size=args.tile_size,
+            repeats=args.benchmark_repeats,
+        )
+        for stage in BENCHMARK_TIMING_KEYS:
+            seconds = timings[stage]
+            display = "n/a" if seconds is None else f"{seconds:.3f} s"
+            print(f"{stage:12s} {display:>12s}")
         return
 
     results = run_batch(paths, params, args.workers, args.tile_size,
