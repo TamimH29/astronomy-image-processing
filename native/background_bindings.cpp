@@ -1,8 +1,10 @@
 #include "background.hpp"
 #include "image_ops.hpp"
 #include <algorithm>
+#include <cmath>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 
 namespace py = pybind11;
 namespace {
@@ -21,7 +23,8 @@ Mask mask_input(const py::object& value, const Pixels& pixels) {
     return Mask(raw);
 }
 py::object estimate(Pixels pixels, py::ssize_t box, py::ssize_t threads,
-                    py::object valid_mask, bool refine, bool profile) {
+                    py::object valid_mask, bool refine, bool profile,
+                    py::object statistics) {
     image_shape(pixels);
     if (box <= 0 || threads <= 0) throw py::value_error("box and threads must be positive integers");
     auto mask = mask_input(valid_mask, pixels);
@@ -29,6 +32,40 @@ py::object estimate(Pixels pixels, py::ssize_t box, py::ssize_t threads,
     py::array_t<float> output({pixels.shape(0), pixels.shape(1)});
     auto* destination = output.mutable_data(); const auto* source = pixels.data();
     const bool* valid = valid_mask.is_none() ? nullptr : mask.data();
+    astro_background::GlobalStatistics provider;
+    if (!statistics.is_none()) {
+        if (!PyCallable_Check(statistics.ptr()))
+            throw py::type_error("global_statistics must be callable");
+        // Reuse an owning mask snapshot so a callback cannot retain a dangling
+        // view into the native refinement loop's temporary source mask.
+        py::array_t<std::uint8_t> snapshot({pixels.shape(0), pixels.shape(1)});
+        auto* snapshot_data = snapshot.mutable_data();
+        provider = [statistics, output, snapshot, snapshot_data, height, width]
+                   (const float* level, const std::uint8_t* source_mask) {
+            py::gil_scoped_acquire acquire;
+            py::object level_arg = py::none(), source_arg = py::none();
+            if (level) {
+                py::array_t<float> view(
+                    {static_cast<py::ssize_t>(height), static_cast<py::ssize_t>(width)},
+                    {static_cast<py::ssize_t>(width * sizeof(float)), static_cast<py::ssize_t>(sizeof(float))},
+                    level, output);
+                view.attr("setflags")(false);
+                level_arg = std::move(view);
+                std::copy_n(source_mask, height * width, snapshot_data);
+                py::array_t<std::uint8_t> source_view(
+                    {static_cast<py::ssize_t>(height), static_cast<py::ssize_t>(width)},
+                    {static_cast<py::ssize_t>(width), py::ssize_t{1}},
+                    snapshot_data, snapshot);
+                source_view.attr("setflags")(false);
+                source_arg = std::move(source_view);
+            }
+            const auto result = statistics(level_arg, source_arg)
+                                    .cast<std::pair<double, double>>();
+            if (!std::isfinite(result.first) || !std::isfinite(result.second) || result.second < 0)
+                throw py::value_error("global_statistics must return a finite center and nonnegative finite noise");
+            return result;
+        };
+    }
     astro_background::Timings timings; astro_background::Diagnostics diagnostics;
     double noise;
     {
@@ -36,7 +73,7 @@ py::object estimate(Pixels pixels, py::ssize_t box, py::ssize_t threads,
         noise = astro_background::estimate(source, height, width, width,
                     static_cast<std::size_t>(box), static_cast<std::size_t>(threads),
                     destination, profile ? &timings : nullptr, valid, refine,
-                    profile ? &diagnostics : nullptr);
+                    profile ? &diagnostics : nullptr, provider);
     }
     if (!profile) return py::make_tuple(output, noise);
     py::dict measured;
@@ -106,15 +143,18 @@ py::object detect(Pixels residual, Pixels filtered, double threshold, py::ssize_
 
 PYBIND11_MODULE(_background_native, module) {
     module.attr("API_VERSION") = 2;
+    module.attr("GLOBAL_STATISTICS_API_VERSION") = 1;
     py::register_exception<astro_background::FloatingPointFailure>(module, "FloatingPointFailure", PyExc_FloatingPointError);
-    module.def("estimate_background", [](Pixels pixels, py::ssize_t box, py::ssize_t threads, py::object valid, bool refine) {
-        return estimate(std::move(pixels), box, threads, std::move(valid), refine, false);
+    module.def("estimate_background", [](Pixels pixels, py::ssize_t box, py::ssize_t threads, py::object valid, bool refine, py::object statistics) {
+        return estimate(std::move(pixels), box, threads, std::move(valid), refine, false, std::move(statistics));
     }, py::arg("pixels"), py::arg("box") = 64, py::arg("threads") = 1,
-       py::kw_only(), py::arg("valid_mask") = py::none(), py::arg("refine") = true);
-    module.def("profile_background", [](Pixels pixels, py::ssize_t box, py::ssize_t threads, py::object valid, bool refine) {
-        return estimate(std::move(pixels), box, threads, std::move(valid), refine, true);
+       py::kw_only(), py::arg("valid_mask") = py::none(), py::arg("refine") = true,
+       py::arg("global_statistics") = py::none());
+    module.def("profile_background", [](Pixels pixels, py::ssize_t box, py::ssize_t threads, py::object valid, bool refine, py::object statistics) {
+        return estimate(std::move(pixels), box, threads, std::move(valid), refine, true, std::move(statistics));
     }, py::arg("pixels"), py::arg("box") = 64, py::arg("threads") = 1,
-       py::kw_only(), py::arg("valid_mask") = py::none(), py::arg("refine") = true);
+       py::kw_only(), py::arg("valid_mask") = py::none(), py::arg("refine") = true,
+       py::arg("global_statistics") = py::none());
     module.def("detect_sources", &detect, py::arg("residual"), py::arg("filtered"),
        py::arg("threshold"), py::arg("min_area"), py::arg("deblend"), py::arg("separation"),
        py::arg("prominence"), py::arg("threads") = 1, py::kw_only(),

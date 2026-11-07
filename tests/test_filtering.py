@@ -106,6 +106,34 @@ def test_gpu_matches_cpu_across_intensity_scales(cupy_device, scale):
     _assert_close(smooth(data, 2.0, "gpu"), smooth(data, 2.0, "cpu"), data)
 
 
+@pytest.mark.parametrize("sigma", [1.0, 2.0])
+@pytest.mark.parametrize("masked", [False, True])
+def test_large_fft_preserves_faint_pixels_near_bright_source(backend, sigma, masked):
+    data = np.random.default_rng(379).normal(1, .1, (1037, 1049)).astype(np.float32)
+    data[114, 118] = 1e6
+    valid = np.ones(data.shape, dtype=bool)
+    if masked:
+        valid[:, :21] = False
+        valid[491:503, 751:763] = False
+    result = smooth(data, sigma, backend, **({"valid_mask": valid} if masked else {}))
+
+    # Direct float64 sums at faint pixels provide an independent reference.
+    # An input-wide tolerance based on the bright peak hides FFT leakage here.
+    radius = math.ceil(4 * sigma)
+    offsets = np.arange(-radius, radius + 1, dtype=np.float64)
+    weights = np.exp(-.5 * (offsets / sigma) ** 2)
+    weights /= weights.sum()
+    kernel = np.outer(weights, weights).astype(np.float32).astype(np.float64)
+    pixels = np.pad(np.where(valid, data, 0).astype(np.float64), radius, mode="symmetric")
+    mask = np.pad(valid.astype(np.float64), radius, mode="symmetric")
+    for y, x in ((0, 23), (28, 44), (487, 754), (520, 777), (1036, 1048)):
+        window = np.s_[y:y+2*radius+1, x:x+2*radius+1]
+        numerator = np.sum(pixels[window] * kernel, dtype=np.float64)
+        denominator = np.sum(mask[window] * kernel, dtype=np.float64) if masked else 1.0
+        expected = numerator / denominator if valid[y, x] and denominator >= .5 else 0.0
+        assert result[y, x] == pytest.approx(expected, rel=0, abs=2e-7)
+
+
 @pytest.mark.parametrize("backend_name", ["cpu", "gpu"])
 @pytest.mark.parametrize("sigma", [0.0, -1.0, float("nan"), float("inf")])
 def test_invalid_sigma(backend_name, sigma):

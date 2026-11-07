@@ -112,6 +112,12 @@ def instrumented(acc):
                         result = background.profile_background(*a, **k)
                         for stage in ("mesh_ms", "interpolation_ms", "noise_ms", "source_mask_ms", "global_median_ms"):
                             acc["background_" + stage[:-3]] += result["timings"][stage] / 1000
+                        for stage, value in result["timings"].items():
+                            if stage.startswith("statistics_"):
+                                if stage.endswith("_ms"):
+                                    acc["background_" + stage[:-3]] += value / 1000
+                                else:
+                                    acc[stage] += value
                         return result["background"], result["noise"]
                     if label == "detect":
                         result = orig(*a, **k, profile=True)
@@ -171,10 +177,19 @@ def report(label, io_secs, stages, n_images):
               f"{100 * secs / grand:13.1f}%")
     print(f"{'total':12s} {1000 * grand / n_images:10.1f} {100.0:13.1f}%")
     print(f"unprofiled processing: {1000 * stages['unprofiled'] / n_images:.2f} ms/image")
-    print("sub-stages (ms/image; global median is a subset of background noise):")
+    print("sub-stages (ms/image; CPU global median is a subset of background noise):")
     for name in ("background_mesh", "background_interpolation", "background_noise", "background_global_median",
                  "background_source_mask", "label", "deblend", "measurement"):
         print(f"  {name:28s} {1000 * stages.get(name, 0) / n_images:10.2f}")
+    if "statistics_calls" in stages:
+        print("GPU statistics (already included in background wall time):")
+        for name in ("setup", "gpu_h2d", "gpu_compute", "gpu_d2h", "host_wait"):
+            key = "background_statistics_" + name
+            print(f"  {name:28s} {1000 * stages.get(key, 0) / n_images:10.2f} ms/image")
+        for name in ("calls", "clipping_passes", "explicit_h2d_bytes",
+                     "scalar_d2h_bytes", "device_buffer_bytes"):
+            print(f"  {name:28s} {stages.get('statistics_' + name, 0) / n_images:10.0f}/image")
+        print("  Event intervals and host waits overlap; do not sum them.")
 
     f = stages["filter"] / grand
     print(f"\nfilter share f = {f:.3f}")
@@ -235,6 +250,7 @@ def main():
               f"({os.environ.get('ASTRO_BACKGROUND_THREADS', '1')} threads); detection: "
               f"{os.environ.get('ASTRO_DETECTION_BACKEND', 'python')} "
               f"({os.environ.get('ASTRO_DETECTION_THREADS', '1')} threads)")
+        print(f"global background statistics: {os.environ.get('ASTRO_BACKGROUND_STATS_BACKEND', 'cpu')}")
 
         time_read(paths, reader)                      # warm the file cache
         io_runs, images = [], None
