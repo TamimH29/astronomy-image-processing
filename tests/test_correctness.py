@@ -37,6 +37,87 @@ def cpu_backends(request, monkeypatch):
     return request.param
 
 
+@pytest.fixture(params=["cpu", "gpu"])
+def science_filter(request):
+    if request.param == "gpu":
+        cp = pytest.importorskip("cupy")
+        if cp.cuda.runtime.getDeviceCount() == 0:
+            pytest.skip("no CUDA device")
+    return request.param
+
+
+@pytest.fixture(params=[("python", 1)] + [("cpp", n) for n in (1, 2, 4, 8, 16, 32)],
+                ids=["python"] + [f"cpp-{n}" for n in (1, 2, 4, 8, 16, 32)])
+def source_detector(request, monkeypatch):
+    backend, threads = request.param
+    if backend == "cpp":
+        pytest.importorskip("astro_pipeline._background_native")
+    monkeypatch.setenv("ASTRO_DETECTION_BACKEND", backend)
+    monkeypatch.setenv("ASTRO_DETECTION_THREADS", str(threads))
+
+
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize("concurrent", [False, True])
+def test_known_source_footprints_brightness_and_centroids(source_detector, science_filter,
+                                                         masked, concurrent):
+    # Independently specified observations: two mirrored six-pixel sources,
+    # a nine-pixel parent too small to contain two accepted sources, and one
+    # uniform twelve-pixel source. Their total brightness is 200 counts.
+    def observe(scale):
+        pixels = np.zeros((5, 25), np.float32)
+        pixels[0, :12] = [3, 5, 9, 5, 4, 3, 3, 4, 5, 9, 5, 3]
+        pixels[2, :9] = [3, 5, 9, 5, 3, 4, 9, 5, 3]
+        pixels[4, :12] = 8
+        valid = None
+        if masked:
+            valid = np.ones(pixels.shape, dtype=bool)
+            valid[:, 17:24] = False
+            pixels[:, 17:24] = 1e6  # unobserved fillers must contribute nothing
+        pixels *= scale
+        tile = Tile("known-sources", 200, 100, pixels, (200, 100, 205, 125), 1, valid)
+        params = DetectionParams(kernel_sigma=.1, threshold_sigma=2, min_area=5,
+                                 backend=science_filter)
+        sources = detection.detect(tile, scale, params)
+        sources.sort(key=lambda s: (s.ymin, s.xmin))
+        assert len(sources) == 4
+        expected = [(100, 200, 105, 200, 6, 29, 102, .5),
+                    (106, 200, 111, 200, 6, 29, 109, .5),
+                    (100, 202, 108, 202, 9, 46, 100 + 183 / 46, 1e-6),
+                    (100, 204, 111, 204, 12, 96, 105.5, 1e-6)]
+        for source, (x0, y0, x1, y1, area, flux, center, tolerance) in zip(sources, expected):
+            assert (source.xmin, source.ymin, source.xmax, source.ymax) == (x0, y0, x1, y1)
+            assert source.area_pix == area
+            assert source.flux == pytest.approx(flux * scale, rel=1e-6)
+            assert source.x_centroid == pytest.approx(center, abs=tolerance)
+            assert source.y_centroid == pytest.approx(y0, abs=1e-6)
+        assert sum(s.area_pix for s in sources) == 33
+        assert sum(s.flux for s in sources) == pytest.approx(200 * scale, rel=1e-6)
+
+    if concurrent:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(observe, (1.0, 100.0)))
+    else:
+        observe(1.0)
+
+
+def test_rejecting_a_small_peak_preserves_source_measurements(source_detector, science_filter):
+    # Two seven-pixel observations. The left source has a secondary peak whose
+    # four-pixel child is below min_area; removing it must not lose its light.
+    pixels = np.array([[3, 5, 9, 5, 4, 3, 8, 4, 3, 4, 5, 9, 5, 3]], np.float32)
+    tile = Tile("small-peak", 0, 0, pixels, (0, 0, 1, 14), 1)
+    sources = detection.detect(tile, 1, DetectionParams(kernel_sigma=.1, threshold_sigma=2,
+                                                       min_area=5, backend=science_filter))
+    sources.sort(key=lambda s: s.xmin)
+    assert len(sources) == 2
+    for source, x0, x1, flux, peak in zip(sources, (0, 7), (6, 13), (37, 33), (2, 11)):
+        assert (source.xmin, source.ymin, source.xmax, source.ymax) == (x0, 0, x1, 0)
+        assert source.area_pix == 7
+        assert source.flux == flux
+        assert abs(source.x_centroid - peak) < .5
+    assert sum(s.area_pix for s in sources) == 14
+    assert sum(s.flux for s in sources) == 70
+
+
 def test_mask_contract_is_appended_and_tiles_preserve_it():
     assert INTERFACE_VERSION == 4
     pixels = np.ones((17, 23), np.float32)
@@ -148,7 +229,7 @@ def test_insufficient_coverage_and_bad_mask(cpu_backends):
         background.estimate_background(data, valid_mask=np.ones_like(data))
 
 
-def test_twenty_isolated_sources_on_real_coverage(cpu_backends):
+def test_twenty_isolated_sources_on_real_coverage(cpu_backends, science_filter, monkeypatch):
     footprint = io_fits.read_fits(str(ROOT / "fits/255wmos.fits"), mask_zero_border=True).valid_mask
     indices = np.arange(512) * 1600 // 512
     valid = footprint[indices[:, None], indices[None, :]]
@@ -168,31 +249,39 @@ def test_twenty_isolated_sources_on_real_coverage(cpu_backends):
     assert len(truth) == 20
     data[~valid] = 0
     image = ImageData("isolated", data.astype(np.float32), {}, valid)
-    sources = detection.process_image(image, DetectionParams(), 64)
-    whole = detection.process_image(image, DetectionParams())
-    assert len(whole) == len(sources)
-    for tiled_source, whole_source in zip(sources, whole):
-        assert (tiled_source.xmin, tiled_source.ymin, tiled_source.xmax, tiled_source.ymax,
-                tiled_source.area_pix) == (whole_source.xmin, whole_source.ymin,
-                                           whole_source.xmax, whole_source.ymax, whole_source.area_pix)
-        np.testing.assert_allclose((tiled_source.x_centroid, tiled_source.y_centroid, tiled_source.flux),
-                                   (whole_source.x_centroid, whole_source.y_centroid, whole_source.flux), rtol=1e-5)
-    positions = np.array([[s.x_centroid, s.y_centroid] for s in sources])
-    distances = np.linalg.norm(positions[:, None] - np.asarray(truth)[None], axis=2)
-    ii, jj = linear_sum_assignment(distances)
-    assert len(ii) == 20 and np.all(distances[ii, jj] < 0.5)
-    assert len(sources) == 20
+    params = DetectionParams(backend=science_filter)
+    for threads in ((1, 2, 4, 8, 16, 32) if cpu_backends[1] == "cpp" else (1,)):
+        monkeypatch.setenv("ASTRO_DETECTION_THREADS", str(threads))
+        sources = detection.process_image(image, params, 64)
+        whole = detection.process_image(image, params)
+        assert len(whole) == len(sources)
+        for tiled_source, whole_source in zip(sources, whole):
+            assert (tiled_source.xmin, tiled_source.ymin, tiled_source.xmax, tiled_source.ymax,
+                    tiled_source.area_pix) == (whole_source.xmin, whole_source.ymin,
+                                               whole_source.xmax, whole_source.ymax, whole_source.area_pix)
+            np.testing.assert_allclose((tiled_source.x_centroid, tiled_source.y_centroid, tiled_source.flux),
+                                       (whole_source.x_centroid, whole_source.y_centroid, whole_source.flux), rtol=1e-5)
+        positions = np.array([[s.x_centroid, s.y_centroid] for s in sources])
+        distances = np.linalg.norm(positions[:, None] - np.asarray(truth)[None], axis=2)
+        ii, jj = linear_sum_assignment(distances)
+        assert len(ii) == 20 and np.all(distances[ii, jj] < 0.5)
+        assert len(sources) == 20
 
 
 @pytest.mark.parametrize("separation,expected", [(2, 1), (8, 2), (12, 2)])
-def test_resolved_and_unresolved_blends(cpu_backends, separation, expected):
+def test_resolved_and_unresolved_blends(cpu_backends, science_filter, separation, expected):
     yy, xx = np.mgrid[:96, :96]
     residual = (40 * np.exp(-((xx-42)**2 + (yy-48)**2) / 4.5)
                 + 40 * np.exp(-((xx-42-separation)**2 + (yy-48)**2) / 4.5)).astype(np.float32)
     tile = Tile("pair", 0, 0, residual, (0, 0, 96, 96), 8)
-    result = detection._measure_sources(tile, filtering.smooth(residual, 2), 2,
-                                         DetectionParams(), profile=True)
+    result = detection._measure_sources(tile, filtering.smooth(residual, 2, science_filter), 2,
+                                         DetectionParams(backend=science_filter), profile=True,
+                                         peak_image=filtering.smooth(residual, 1, science_filter))
     assert len(result["sources"]) == expected
+    centers = sorted(s.x_centroid for s in result["sources"])
+    np.testing.assert_allclose(centers, [42 + separation / 2] if expected == 1 else [42, 42 + separation],
+                               rtol=0, atol=.5)
+    assert all(abs(s.y_centroid - 48) < .5 for s in result["sources"])
     assert sum(s.area_pix for s in result["sources"]) == np.count_nonzero(result["labels"])
     assert sum(s.flux for s in result["sources"]) == pytest.approx(float(residual[result["labels"] > 0].sum(dtype=np.float64)), rel=1e-12)
 

@@ -123,6 +123,19 @@ def instrumented(acc):
                         result = orig(*a, **k, profile=True)
                         for stage in ("label_ms", "deblend_ms", "measurement_ms"):
                             acc[stage[:-3]] += result["timings"][stage] / 1000
+                        for stage in ("deblend_prepare_ms", "deblend_markers_ms",
+                                      "deblend_watershed_ms", "deblend_pruning_ms"):
+                            if stage in result["timings"]:
+                                acc[stage[:-3]] += result["timings"][stage] / 1000
+                        components = result.get("deblend_components", [])
+                        if components:
+                            acc["deblend_regions"] += len(components)
+                            for counter in ("queue_pushes", "queue_pops", "passes"):
+                                acc["deblend_" + counter] += sum(c[counter] for c in components)
+                            largest = max(components, key=lambda c: c["total_ms"])
+                            acc["deblend_largest_region"] += largest["total_ms"] / 1000
+                            acc["deblend_largest_pixels"] += largest["pixels"]
+                            acc["deblend_queue_peak"] += max(c["queue_peak"] for c in components)
                         return result["sources"]
                     return orig(*a, **k)
                 finally:
@@ -181,6 +194,13 @@ def report(label, io_secs, stages, n_images):
     for name in ("background_mesh", "background_interpolation", "background_noise", "background_global_median",
                  "background_source_mask", "label", "deblend", "measurement"):
         print(f"  {name:28s} {1000 * stages.get(name, 0) / n_images:10.2f}")
+    if "deblend_regions" in stages:
+        print("deblending component work (summed durations can overlap across workers):")
+        for name in ("prepare", "markers", "watershed", "pruning"):
+            print(f"  {name:28s} {1000 * stages['deblend_' + name] / n_images:10.2f} ms/image")
+        print(f"  {'largest region':28s} {1000 * stages['deblend_largest_region'] / n_images:10.2f} ms/image")
+        for name in ("regions", "largest_pixels", "passes", "queue_pushes", "queue_pops", "queue_peak"):
+            print(f"  {name:28s} {stages['deblend_' + name] / n_images:10.0f}/image")
     if "statistics_calls" in stages:
         print("GPU statistics (already included in background wall time):")
         for name in ("setup", "gpu_h2d", "gpu_compute", "gpu_d2h", "host_wait"):

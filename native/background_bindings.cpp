@@ -122,7 +122,7 @@ py::object detect(Pixels residual, Pixels filtered, double threshold, py::ssize_
         computed = astro_cpu::detect(raw, image, valid, h, w, threshold,
                     static_cast<std::size_t>(min_area), deblend, static_cast<std::size_t>(separation),
                     prominence, static_cast<std::size_t>(threads), sharp,
-                    static_cast<std::size_t>(centroid_radius));
+                    static_cast<std::size_t>(centroid_radius), profile);
     }
     py::list rows;
     for (const auto& row : computed.rows)
@@ -136,7 +136,37 @@ py::object detect(Pixels residual, Pixels filtered, double threshold, py::ssize_
     timings["measurement_ms"] = computed.timings.measurement_ms;
     timings["effective_threads"] = computed.timings.effective_threads;
     timings["total_ms"] = computed.timings.total_ms;
+    py::list components;
+    double prepare_ms = 0, marker_ms = 0, watershed_ms = 0, pruning_ms = 0;
+    for (const auto& component : computed.deblend_components) {
+        py::dict detail;
+        detail["bbox"] = py::make_tuple(component.x0, component.y0, component.x1, component.y1);
+        detail["pixels"] = component.pixels;
+        detail["markers"] = component.markers;
+        detail["children"] = component.children;
+        detail["passes"] = component.passes;
+        detail["queue_pushes"] = component.queue_pushes;
+        detail["queue_pops"] = component.queue_pops;
+        detail["queue_peak"] = component.queue_peak;
+        detail["prepare_ms"] = component.prepare_ms;
+        detail["marker_ms"] = component.marker_ms;
+        detail["watershed_ms"] = component.watershed_ms;
+        detail["pruning_ms"] = component.pruning_ms;
+        detail["total_ms"] = component.total_ms;
+        components.append(std::move(detail));
+        prepare_ms += component.prepare_ms;
+        marker_ms += component.marker_ms;
+        watershed_ms += component.watershed_ms;
+        pruning_ms += component.pruning_ms;
+    }
+    // Component durations may overlap across workers; deblend_ms remains the
+    // elapsed stage time used for pipeline shares and Amdahl calculations.
+    timings["deblend_prepare_ms"] = prepare_ms;
+    timings["deblend_markers_ms"] = marker_ms;
+    timings["deblend_watershed_ms"] = watershed_ms;
+    timings["deblend_pruning_ms"] = pruning_ms;
     py::dict result; result["rows"] = rows; result["labels"] = labels; result["timings"] = timings;
+    result["deblend_components"] = components;
     return result;
 }
 } // namespace

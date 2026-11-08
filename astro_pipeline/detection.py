@@ -83,7 +83,10 @@ def _measure_sources(tile: Tile, filtered: np.ndarray, noise_sigma: float,
                for cx, cy, x0, y0, x1, y1, area, flux in rows]
     if profile:
         timings["total_ms"] = (perf_counter() - started) * 1000
-        return dict(sources=sources, labels=labels, timings=timings)
+        measured = dict(sources=sources, labels=labels, timings=timings)
+        if backend == "cpp":
+            measured["deblend_components"] = result.get("deblend_components", [])
+        return measured
     return sources
 
 
