@@ -343,7 +343,7 @@ def test_known_sky_with_real_mosaic_coverage(accuracy_backend):
 
 
 @pytest.mark.parametrize("background_backend,detector_backend", [
-    ("numpy", "python"), ("cpp", "python"), ("numpy", "cpp"), ("cpp", "cpp")])
+    ("numpy", "python"), ("cpp", "python"), ("numpy", "cpp"), ("cpp", "cpp"), ("resident", "resident")])
 @pytest.mark.parametrize("filename,required", [("Vcomb.fits", 20), ("green.fits", 19),
                                                ("255wmos.fits", 20), ("555wmos.fits", 20)])
 @pytest.mark.parametrize("filter_backend", ["cpu", "gpu"])
@@ -360,8 +360,8 @@ def test_real_fits_injected_star_recovery(request, monkeypatch, filename, requir
         cp = pytest.importorskip("cupy")
         if cp.cuda.runtime.getDeviceCount() == 0:
             pytest.skip("no CUDA device")
-    monkeypatch.setenv("ASTRO_BACKGROUND_BACKEND", background_backend)
-    monkeypatch.setenv("ASTRO_DETECTION_BACKEND", detector_backend)
+    monkeypatch.setenv("ASTRO_BACKGROUND_BACKEND", "numpy" if background_backend == "resident" else background_backend)
+    monkeypatch.setenv("ASTRO_DETECTION_BACKEND", "python" if detector_backend == "resident" else detector_backend)
     monkeypatch.setenv("ASTRO_BACKGROUND_THREADS", "4")
     monkeypatch.setenv("ASTRO_DETECTION_THREADS", "4")
     fixture = Path(__file__).parent / "fixtures/real_star_injections.json"
@@ -377,7 +377,8 @@ def test_real_fits_injected_star_recovery(request, monkeypatch, filename, requir
         model *= source["flux"] / model.sum()
         pixels[iy-6:iy+7, ix-6:ix+7] += model.astype(np.float32)
     sources = detection.process_image(ImageData(image.image_id, pixels, image.header, image.valid_mask),
-                                      DetectionParams(backend=filter_backend), 256)
+                                      DetectionParams(backend=filter_backend,
+                                          pipeline_backend="gpu" if background_backend == "resident" else "staged"), 256)
     measured = np.array([[source.x_centroid, source.y_centroid] for source in sources])
     expected = np.array([[source["x"], source["y"]] for source in truth])
     distances = np.linalg.norm(measured[:, None] - expected[None], axis=2)

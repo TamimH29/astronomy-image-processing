@@ -17,11 +17,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import os
 import resource
 import statistics
 import sys
-import tempfile
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -163,6 +163,20 @@ def time_process(images, params, tile_size):
     for image in images:
         detection.process_image(image, params, tile_size)
     unprofiled = time.perf_counter() - started
+    if params.pipeline_backend == "gpu":
+        from astro_pipeline._pipeline_gpu import process_image
+        acc = defaultdict(float)
+        started = time.perf_counter()
+        for image in images:
+            result = process_image(image, image.data,
+                background._valid_mask(image.data.shape, image.valid_mask), params,
+                tile_size or max(image.data.shape), profile=True)
+            for key, value in result["timings"].items():
+                acc[key[:-3] if key.endswith("_ms") else key] += value/1000 if key.endswith("_ms") else value
+        acc["total"] = time.perf_counter()-started
+        acc["unprofiled"] = unprofiled
+        acc["other"] = acc["total"]-sum(acc[k] for k in ("background", "tile", "filter", "detect", "merge"))
+        return dict(acc)
     acc = defaultdict(float)
     with instrumented(acc):
         t0 = time.perf_counter()
@@ -179,7 +193,7 @@ def time_process(images, params, tile_size):
     return out
 
 
-def report(label, io_secs, stages, n_images):
+def report(label, io_secs, stages, n_images, pipeline_backend="staged"):
     grand = io_secs + stages["total"]
     print(f"\n=== tile_size = {label} ===")
     print(f"{'stage':12s} {'ms/image':>10s} {'% of pipeline':>14s}")
@@ -211,14 +225,21 @@ def report(label, io_secs, stages, n_images):
             print(f"  {name:28s} {stages.get('statistics_' + name, 0) / n_images:10.0f}/image")
         print("  Event intervals and host waits overlap; do not sum them.")
 
-    f = stages["filter"] / grand
-    print(f"\nfilter share f = {f:.3f}")
-    print(f"Amdahl bound (infinitely fast GPU filter): {1 / (1 - f):.2f}x")
+    migrated = ("background", "filter", "detect") if pipeline_backend == "gpu" else ("filter",)
+    f = sum(stages[k] for k in migrated) / grand
+    print(f"\naccelerated-stage share f = {f:.3f} ({', '.join(migrated)})")
+    print(f"Amdahl bound (infinitely fast accelerated stages): {1 / (1 - f):.2f}x")
     for s in (5, 10, 20):
-        print(f"  filter {s:>2d}x faster -> overall {1 / ((1 - f) + f / s):.2f}x")
+        print(f"  stages {s:>2d}x faster -> overall {1 / ((1 - f) + f / s):.2f}x")
     print("2x target " + ("is reachable" if f > 0.5 else "is NOT reachable")
-          + " by speeding up the filter alone"
+          + " by speeding up these stages alone"
           + ("" if f > 0.5 else " (f must exceed 0.5)"))
+    if pipeline_backend == "gpu":
+        print("resident GPU diagnostics (event intervals include stream waits):")
+        for key in ("gpu_h2d", "gpu_compute", "gpu_d2h", "deblend_markers", "deblend_watershed", "deblend_pruning"):
+            print(f"  {key:28s} {1000*stages.get(key, 0)/n_images:10.2f} ms/image")
+        for key in ("explicit_h2d_bytes", "catalog_d2h_bytes", "scalar_d2h_bytes", "device_pool_peak_bytes"):
+            print(f"  {key:28s} {stages.get(key, 0)/n_images:10.0f} bytes/image")
 
 
 def parse_tile_sizes(items):
@@ -240,6 +261,10 @@ def main():
                     help='e.g. none 512 1024 ("none" = whole image)')
     ap.add_argument("--kernel-sigma", type=float, default=2.0)
     ap.add_argument("--backend", choices=("cpu", "gpu"), default="cpu")
+    ap.add_argument("--pipeline-backend", choices=("staged", "gpu"), default="staged")
+    ap.add_argument("--cpu-filter", choices=("fft", "separable"), default="fft",
+                    help="benchmark the existing FFT baseline or a spatial separable CPU baseline")
+    ap.add_argument("--results-dir", type=Path, default=Path("benchmarks/results/gpu-migration"))
     ap.add_argument("--mask-zero-border", action="store_true")
     ap.add_argument("--no-background-refinement", action="store_true")
     ap.add_argument("--no-deblend", action="store_true")
@@ -248,9 +273,24 @@ def main():
 
     params = DetectionParams(kernel_sigma=args.kernel_sigma, backend=args.backend,
                              refine_background=not args.no_background_refinement,
-                             deblend=not args.no_deblend)
+                             deblend=not args.no_deblend, pipeline_backend=args.pipeline_backend)
+    if args.cpu_filter == "separable":
+        from scipy.ndimage import gaussian_filter
+        def separable(data, sigma):
+            pixels, _, radius = filtering._filter_input(data, sigma)
+            return gaussian_filter(pixels.astype(np.float64), sigma, radius=radius,
+                                   mode="reflect").astype(np.float32)
+        filtering._smooth_cpu = separable
 
-    with tempfile.TemporaryDirectory() as tmp:
+    args.results_dir.mkdir(parents=True, exist_ok=True)
+    inputs_dir = args.results_dir / "inputs"
+    inputs_dir.mkdir(exist_ok=True)
+    saved = dict(pipeline_backend=args.pipeline_backend, filter_backend=args.backend,
+                 cpu_filter=args.cpu_filter, repeats=args.repeats, workers=args.workers,
+                 environment={key: value for key, value in os.environ.items() if key.startswith("ASTRO_")},
+                 configurations=[])
+
+    with contextlib.nullcontext(str(inputs_dir)) as tmp:
         if args.input:
             paths = collect_paths(args.input)
             paths = paths[:args.limit]
@@ -279,27 +319,37 @@ def main():
             io_runs.append(secs)
         io_secs = statistics.median(io_runs)
 
+        warm_started = time.perf_counter()
         time_process(images[:1], params, None)        # warm up FFT / imports
+        saved["initialization_and_warmup_s"] = time.perf_counter()-warm_started
 
         for tile_size in parse_tile_sizes(args.tile_sizes):
             runs = [time_process(images, params, tile_size)
                     for _ in range(args.repeats)]
             med = {k: statistics.median(r[k] for r in runs) for k in runs[0]}
             report("none (whole image)" if tile_size is None else tile_size,
-                   io_secs, med, len(images))
+                   io_secs, med, len(images), args.pipeline_backend)
             batch = []
+            from astro_pipeline.io_fits import write_catalog
+            catalog_path = args.results_dir / f"catalog-{tile_size or 'whole'}.csv"
             for _ in range(args.repeats):
                 started = time.perf_counter()
-                run_batch(paths, params, args.workers, tile_size, mask_zero_border=args.mask_zero_border)
+                results = run_batch(paths, params, args.workers, tile_size, mask_zero_border=args.mask_zero_border)
+                write_catalog([source for image_id in sorted(results) for source in results[image_id]], str(catalog_path))
                 batch.append(time.perf_counter() - started)
-            print(f"FITS-to-sources batch wall time ({args.workers} workers, includes I/O and pool startup): "
+            print(f"FITS-to-written-catalog batch wall time ({args.workers} workers, includes I/O and pool startup): "
                   f"{statistics.median(batch):.3f} s")
+            saved["configurations"].append(dict(tile_size=tile_size, inputs=paths, raw_stage_runs_s=runs,
+                median_stages_s=med, raw_io_runs_s=io_runs, raw_fits_to_catalog_s=batch,
+                median_fits_to_catalog_s=statistics.median(batch)))
 
     print(f"process peak RSS: {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024:.1f} MiB "
           "(includes resident inputs and profiling buffers)")
     if args.workers > 1:
         print(f"largest child peak RSS: {resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024:.1f} MiB "
               "(not aggregate worker memory)")
+    saved["peak_rss_mib"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024
+    (args.results_dir / "timings.json").write_text(json.dumps(saved, indent=2)+"\n")
 
     print("\nNotes: The OS file cache is warm, so I/O is a "
           "lower bound;\nreal SDSS .bz2 files add decompression time. "

@@ -6,11 +6,42 @@ three scalars per clipping pass. CuPy compaction can also synchronize internally
 """
 from __future__ import annotations
 
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from importlib import import_module
 from time import perf_counter
 
 import numpy as np
+
+
+def clipped_statistics_device(samples, scratch, keep_buffer, observe, *, timed=nullcontext):
+    """Shared resident median/MAD operation for staged and full-GPU execution.
+
+    `observe(center, noise, count)` reads only a scalar status packet. Buffers
+    belong to the caller, so bootstrap and refinement reuse the same storage.
+    """
+    import cupy as cp
+    if not samples.size:
+        raise ValueError("insufficient background coverage: no source-free observations")
+    passes = 0
+    for iteration in range(6):
+        with timed():
+            center = cp.median(samples, overwrite_input=True)
+            deviations = scratch[:samples.size]
+            cp.subtract(samples, center, out=deviations)
+            cp.abs(deviations, out=deviations)
+            noise = cp.median(deviations, overwrite_input=True)*cp.float64(1.4826)
+            keep = keep_buffer[:samples.size]
+            # Selection rearranges deviations; rebuild correspondence to samples.
+            cp.subtract(samples, center, out=deviations)
+            cp.abs(deviations, out=deviations)
+            cp.less_equal(deviations, 3*noise, out=keep)
+            count = cp.count_nonzero(keep)
+        noise_value, kept = observe(center, noise, count)
+        if noise_value == 0 or kept == samples.size or iteration == 5:
+            return center, noise, passes
+        passes += 1
+        with timed():
+            samples = samples[keep]
 
 
 class GpuBackgroundStatistics:
@@ -127,33 +158,16 @@ class GpuBackgroundStatistics:
             if samples.size == 0:
                 raise ValueError("insufficient background coverage: no source-free observations")
             self._metrics["statistics_calls"] += 1
-            # Five clipping passes and, when necessary, the final summary.
-            # Global medians remain exact: no averages of per-chunk medians.
-            for iteration in range(6):
-                with self._timed("compute"):
-                    center = cp.median(samples, overwrite_input=True)
-                    deviations = self.scratch[:samples.size]
-                    cp.subtract(samples, center, out=deviations)
-                    cp.abs(deviations, out=deviations)
-                    noise = cp.median(deviations, overwrite_input=True) * cp.float64(1.4826)
-                    self.packet[0], self.packet[1] = center, noise
-                    if iteration < 5:
-                        # Median selection rearranges deviations, so recreate
-                        # corresponding deviations before compacting samples.
-                        cp.subtract(samples, center, out=deviations)
-                        cp.abs(deviations, out=deviations)
-                        keep = self.keep[:samples.size]
-                        cp.less_equal(deviations, cp.float64(3) * noise, out=keep)
-                        self.packet[2] = cp.count_nonzero(keep)
-                    else:
-                        self.packet[2] = samples.size
-                center_value, noise_value, kept = self._read_packet()
-                if noise_value == 0 or kept == samples.size or iteration == 5:
-                    return center_value, noise_value
-                self._metrics["statistics_clipping_passes"] += 1
-                with self._timed("compute"):
-                    samples = samples[keep]
-        raise AssertionError("unreachable clipping state")
+            last = None
+            def observe(center, noise, count):
+                nonlocal last
+                self.packet[0], self.packet[1], self.packet[2] = center, noise, count
+                last = self._read_packet()
+                return last[1:]
+            _, _, passes = clipped_statistics_device(samples, self.scratch, self.keep,
+                observe, timed=lambda: self._timed("compute"))
+            self._metrics["statistics_clipping_passes"] += passes
+            return last[:2]
 
     def timings(self):
         """Event intervals are stream elapsed times, not isolated kernel costs.

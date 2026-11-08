@@ -46,14 +46,19 @@ def science_filter(request):
     return request.param
 
 
-@pytest.fixture(params=[("python", 1)] + [("cpp", n) for n in (1, 2, 4, 8, 16, 32)],
-                ids=["python"] + [f"cpp-{n}" for n in (1, 2, 4, 8, 16, 32)])
+@pytest.fixture(params=[("python", 1), ("gpu", 1)] + [("cpp", n) for n in (1, 2, 4, 8, 16, 32)],
+                ids=["python", "resident-gpu"] + [f"cpp-{n}" for n in (1, 2, 4, 8, 16, 32)])
 def source_detector(request, monkeypatch):
     backend, threads = request.param
     if backend == "cpp":
         pytest.importorskip("astro_pipeline._background_native")
+    if backend == "gpu":
+        cp = pytest.importorskip("cupy")
+        if not cp.cuda.runtime.getDeviceCount():
+            pytest.skip("CUDA device required")
     monkeypatch.setenv("ASTRO_DETECTION_BACKEND", backend)
     monkeypatch.setenv("ASTRO_DETECTION_THREADS", str(threads))
+    return backend
 
 
 @pytest.mark.parametrize("masked", [False, True])
@@ -76,7 +81,8 @@ def test_known_source_footprints_brightness_and_centroids(source_detector, scien
         pixels *= scale
         tile = Tile("known-sources", 200, 100, pixels, (200, 100, 205, 125), 1, valid)
         params = DetectionParams(kernel_sigma=.1, threshold_sigma=2, min_area=5,
-                                 backend=science_filter)
+                                 backend=science_filter,
+                                 pipeline_backend="gpu" if source_detector == "gpu" else "staged")
         sources = detection.detect(tile, scale, params)
         sources.sort(key=lambda s: (s.ymin, s.xmin))
         assert len(sources) == 4
@@ -106,7 +112,8 @@ def test_rejecting_a_small_peak_preserves_source_measurements(source_detector, s
     pixels = np.array([[3, 5, 9, 5, 4, 3, 8, 4, 3, 4, 5, 9, 5, 3]], np.float32)
     tile = Tile("small-peak", 0, 0, pixels, (0, 0, 1, 14), 1)
     sources = detection.detect(tile, 1, DetectionParams(kernel_sigma=.1, threshold_sigma=2,
-                                                       min_area=5, backend=science_filter))
+                                                       min_area=5, backend=science_filter,
+                                                       pipeline_backend="gpu" if source_detector == "gpu" else "staged"))
     sources.sort(key=lambda s: s.xmin)
     assert len(sources) == 2
     for source, x0, x1, flux, peak in zip(sources, (0, 7), (6, 13), (37, 33), (2, 11)):
@@ -119,7 +126,7 @@ def test_rejecting_a_small_peak_preserves_source_measurements(source_detector, s
 
 
 def test_mask_contract_is_appended_and_tiles_preserve_it():
-    assert INTERFACE_VERSION == 4
+    assert INTERFACE_VERSION == 5
     pixels = np.ones((17, 23), np.float32)
     valid = pixels.astype(bool)
     valid[7:12, 8:13] = False
