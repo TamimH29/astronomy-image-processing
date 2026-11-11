@@ -32,6 +32,8 @@ def main(argv=None) -> None:
     ap.add_argument("--tile-size", type=int, default=None,
                     help="omit for whole-image processing")
     ap.add_argument("--backend", choices=["cpu", "gpu"], default="cpu")
+    ap.add_argument("--pipeline-backend", choices=["staged", "gpu"], default="staged",
+                    help="gpu runs all numerical stages on device; --backend and stage environment selectors apply to staged mode")
     ap.add_argument("--kernel-sigma", type=float, default=2.0)
     ap.add_argument("--threshold-sigma", type=float, default=3.0)
     ap.add_argument("--min-area", type=int, default=5)
@@ -55,7 +57,8 @@ def main(argv=None) -> None:
                              refine_background=not args.no_background_refinement,
                              deblend=not args.no_deblend,
                              deblend_min_separation=args.deblend_min_separation,
-                             deblend_prominence_sigma=args.deblend_prominence_sigma)
+                             deblend_prominence_sigma=args.deblend_prominence_sigma,
+                             pipeline_backend=args.pipeline_backend)
 
     if args.benchmark:
         timings = benchmark(

@@ -21,6 +21,8 @@ def _validate_params(params: DetectionParams) -> None:
         raise ValueError("min_area must be a positive integer")
     if params.backend not in ("cpu", "gpu"):
         raise ValueError(f"unknown backend {params.backend!r}")
+    if params.pipeline_backend not in ("staged", "gpu"):
+        raise ValueError("pipeline_backend must be staged or gpu")
     if not isinstance(params.refine_background, (bool, np.bool_)) or not isinstance(params.deblend, (bool, np.bool_)):
         raise ValueError("refine_background and deblend must be boolean")
     separation = params.deblend_min_separation
@@ -83,7 +85,10 @@ def _measure_sources(tile: Tile, filtered: np.ndarray, noise_sigma: float,
                for cx, cy, x0, y0, x1, y1, area, flux in rows]
     if profile:
         timings["total_ms"] = (perf_counter() - started) * 1000
-        return dict(sources=sources, labels=labels, timings=timings)
+        measured = dict(sources=sources, labels=labels, timings=timings)
+        if backend == "cpp":
+            measured["deblend_components"] = result.get("deblend_components", [])
+        return measured
     return sources
 
 
@@ -113,6 +118,9 @@ def detect(tile: Tile, noise_sigma: float, params: DetectionParams
         raise ValueError("tile core must lie inside its image window")
     mask = background._valid_mask(pixels.shape, tile.valid_mask)
     normalized = Tile(tile.image_id, tile.y0, tile.x0, pixels, tile.core, tile.halo, tile.valid_mask)
+    if params.pipeline_backend == "gpu":
+        from ._pipeline_gpu import detect_tile
+        return detect_tile(normalized, mask, noise_sigma, params)
     filtered = filtering.smooth(pixels, params.kernel_sigma, params.backend,
                                 **({"valid_mask": mask} if tile.valid_mask is not None else {}))
     peak_image = None
@@ -143,6 +151,9 @@ def process_image(img: ImageData, params: DetectionParams,
     valid = background._valid_mask(pixels.shape, img.valid_mask)
     if not valid.any():
         raise ValueError("image has no usable observations")
+    if params.pipeline_backend == "gpu":
+        from ._pipeline_gpu import process_image as process_gpu
+        return process_gpu(img, pixels, valid, params, tile_size)
     level, noise = background.estimate_background(pixels, valid_mask=img.valid_mask,
                                                   refine=params.refine_background)
     with np.errstate(over="raise", invalid="raise"):

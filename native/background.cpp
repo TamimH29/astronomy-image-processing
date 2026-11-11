@@ -191,7 +191,8 @@ astro_cpu::Mask fill_mesh(std::vector<double>& mesh, const std::vector<double>& 
 double estimate(const float* pixels, std::size_t height, std::size_t width,
                 std::size_t row_stride, std::size_t box, std::size_t threads,
                 float* background, Timings* timings, const bool* valid_mask,
-                bool refine, Diagnostics* diagnostics) {
+                bool refine, Diagnostics* diagnostics,
+                const GlobalStatistics& global_statistics) {
     const auto started = Clock::now();
     if (!height || !width || !box || !threads || !pixels || !background || row_stride < width)
         throw std::invalid_argument("nonempty image, positive box/threads, and valid strides required");
@@ -237,8 +238,14 @@ double estimate(const float* pixels, std::size_t height, std::size_t width,
     };
     auto phase = Clock::now();
     if (refine) {
-        gather(false, false);
-        const auto stats = clipped_stats(global, workers);
+        Stats stats;
+        if (global_statistics) {
+            const auto result = global_statistics(nullptr, nullptr);
+            stats = {result.first, result.second};
+        } else {
+            gather(false, false);
+            stats = clipped_stats(global, workers);
+        }
         double range = 0;
         for (std::size_t p = 0; p < count; ++p) if (valid[p]) range = std::max(range, std::abs(static_cast<double>(data[p]) - stats.center));
         const auto floor = 8 * std::numeric_limits<float>::epsilon() * range;
@@ -297,8 +304,12 @@ double estimate(const float* pixels, std::size_t height, std::size_t width,
         });
         measured.interpolation_ms += milliseconds(phase);
         phase = Clock::now();
-        gather(true, true);
-        noise = clipped_stats(global, workers, timings ? &measured.global_median_ms : nullptr).noise;
+        if (global_statistics) {
+            noise = global_statistics(background, source.data()).second;
+        } else {
+            gather(true, true);
+            noise = clipped_stats(global, workers, timings ? &measured.global_median_ms : nullptr).noise;
+        }
         measured.noise_ms += milliseconds(phase);
         if (!refine || iteration == 2) break;
         phase = Clock::now();

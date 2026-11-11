@@ -1,4 +1,4 @@
-"""Person 3: CPU background-map and pre-filter noise estimation.
+"""Person 3: background-map and pre-filter noise estimation.
 
 Background clipping rejects statistical outliers; source detection applies a
 separate threshold in detection.py using DetectionParams.threshold_sigma.
@@ -107,7 +107,7 @@ def _native_module(stage):
 
 def estimate_background(img: np.ndarray, box: int = 64, *, valid_mask=None,
                         refine: bool = True) -> tuple[np.ndarray, float]:
-    """Return a float32 sky map and scalar pre-filter sky noise on the CPU.
+    """Return a float32 sky map and scalar pre-filter sky noise.
 
     Coverage and source exclusion are separate: invalid observations never enter
     statistics, while bright sources are excluded only from sky fitting. At most
@@ -115,6 +115,9 @@ def estimate_background(img: np.ndarray, box: int = 64, *, valid_mask=None,
     DetectionParams.threshold_sigma does not change these background rules.
     `refine=False` disables source exclusion for ablation/legacy comparisons.
     ASTRO_BACKGROUND_BACKEND=numpy (default) or cpp selects matching algorithms.
+    ASTRO_BACKGROUND_STATS_BACKEND=cpu (default) or gpu independently selects
+    global bootstrap/noise statistics. GPU mode retains per-image device buffers;
+    mesh fitting, source exclusion, and the shared return types stay on the CPU.
     """
     return _dispatch(img, box, valid_mask, refine, False)
 
@@ -134,15 +137,41 @@ def _dispatch(img, box, valid_mask, refine, profile):
     if not isinstance(refine, (bool, np.bool_)):
         raise ValueError("refine must be boolean")
     backend = os.environ.get("ASTRO_BACKGROUND_BACKEND", "numpy")
-    if backend == "numpy":
-        return _estimate_background_numpy(pixels, int(box), valid_mask=valid, refine=refine, profile=profile)
-    if backend != "cpp":
+    if backend not in ("numpy", "cpp"):
         raise ValueError("ASTRO_BACKGROUND_BACKEND must be numpy or cpp")
-    threads = _native_threads("BACKGROUND")
-    native = _native_module("BACKGROUND")
-    operation = native.profile_background if profile else native.estimate_background
-    return operation(pixels, min(int(box), np.iinfo(np.intp).max), threads,
-                     valid_mask=valid, refine=bool(refine))
+    stats_backend = os.environ.get("ASTRO_BACKGROUND_STATS_BACKEND", "cpu")
+    if stats_backend not in ("cpu", "gpu"):
+        raise ValueError("ASTRO_BACKGROUND_STATS_BACKEND must be cpu or gpu")
+    threads = _native_threads("BACKGROUND") if backend == "cpp" else 1
+    native = _native_module("BACKGROUND") if backend == "cpp" else None
+    if (stats_backend == "gpu" and native is not None
+            and getattr(native, "GLOBAL_STATISTICS_API_VERSION", 0) != 1):
+        raise ImportError("native extension lacks GPU statistics support; rebuild it with CMake")
+    started = perf_counter()
+    statistics = None
+    if stats_backend == "gpu":
+        from ._background_gpu import GpuBackgroundStatistics
+        statistics = GpuBackgroundStatistics(pixels, valid, profile=profile)
+    try:
+        if native is None:
+            result = _estimate_background_numpy(pixels, int(box), valid_mask=valid,
+                                                refine=refine, profile=profile,
+                                                statistics=statistics)
+        else:
+            operation = native.profile_background if profile else native.estimate_background
+            options = dict(valid_mask=valid, refine=bool(refine))
+            if statistics is not None:
+                options["global_statistics"] = statistics
+            result = operation(pixels, min(int(box), np.iinfo(np.intp).max), threads, **options)
+    finally:
+        if statistics is not None:
+            statistics.close()
+    if statistics is not None and profile:
+        result["timings"].update(statistics.timings())
+        # Include context construction, upload, callback marshaling, waits,
+        # and profile exports rather than reporting just kernel intervals.
+        result["timings"]["total_ms"] = (perf_counter() - started) * 1000
+    return result
 
 
 def _solve(matrix, rhs):
@@ -203,7 +232,7 @@ def _fill_mesh(mesh, centers_y, centers_x, box):
     return measured
 
 
-def _fit_numpy(pixels, box, valid, source, timings, profile):
+def _fit_numpy(pixels, box, valid, source, timings, profile, statistics=None):
     height, width = pixels.shape
     ys = list(range(0, height, box))
     xs = list(range(0, width, box))
@@ -239,16 +268,20 @@ def _fit_numpy(pixels, box, valid, source, timings, profile):
     sky = valid & ~source
     if not sky.any():
         raise ValueError("insufficient background coverage: no source-free observations")
-    residual = pixels[sky].astype(np.float64) - background[sky]
-    selection = [0.0] if profile else None
-    noise = _clipped_stats(residual, _selection=selection)[1]
+    selection = [0.0] if profile and statistics is None else None
+    if statistics is None:
+        residual = pixels[sky].astype(np.float64) - background[sky]
+        noise = _clipped_stats(residual, _selection=selection)[1]
+    else:
+        noise = statistics(background, source)[1]
     timings["noise_ms"] += (perf_counter() - started) * 1000
     if selection is not None:
         timings["global_median_ms"] += selection[0]
     return background, noise, mesh, measured
 
 
-def _estimate_background_numpy(pixels, box, *, valid_mask=None, refine=True, profile=False):
+def _estimate_background_numpy(pixels, box, *, valid_mask=None, refine=True, profile=False,
+                               statistics=None):
     started = perf_counter()
     valid = _valid_mask(pixels.shape, valid_mask)
     timings = dict(mesh_ms=0.0, interpolation_ms=0.0, noise_ms=0.0,
@@ -256,7 +289,8 @@ def _estimate_background_numpy(pixels, box, *, valid_mask=None, refine=True, pro
     mask_started = perf_counter()
     seed = np.zeros(pixels.shape, dtype=bool)
     if refine:
-        center, noise = _clipped_stats(pixels[valid])
+        center, noise = (_clipped_stats(pixels[valid]) if statistics is None
+                         else statistics(None, None))
         floor = 8 * np.finfo(np.float32).eps * float(np.max(np.abs(pixels[valid].astype(np.float64) - center)))
         seed = _segmentation.source_seeds(pixels, valid, center + max(3 * noise, floor))
     yy, xx = np.mgrid[-8:9, -8:9]
@@ -266,7 +300,8 @@ def _estimate_background_numpy(pixels, box, *, valid_mask=None, refine=True, pro
         mask_started = perf_counter()
         source = (binary_dilation(seed, structure=footprint) & valid) if seed.any() else seed.copy()
         timings["source_mask_ms"] += (perf_counter() - mask_started) * 1000
-        level, noise, mesh, measured = _fit_numpy(pixels, box, valid, source, timings, profile)
+        level, noise, mesh, measured = _fit_numpy(pixels, box, valid, source, timings, profile,
+                                                statistics=statistics)
         if not refine or iteration == 2:
             break
         mask_started = perf_counter()
