@@ -28,14 +28,16 @@ def _filter_input(data: np.ndarray, kernel_sigma: float
 
 
 def _smooth_cpu(data: np.ndarray, kernel_sigma: float) -> np.ndarray:
-    """Linear FFT convolution with a normalized, four-sigma Gaussian."""
+    """Float64 FFT convolution with the shared four-sigma Gaussian kernel."""
     from scipy.signal import fftconvolve
 
     pixels, kernel, radius = _filter_input(data, kernel_sigma)
     # NumPy symmetric padding repeats the edge pixel, matching ndimage's
     # half-sample 'reflect' convention. Valid convolution restores input shape.
-    padded = np.pad(pixels, radius, mode="symmetric")
-    filtered = np.array(fftconvolve(padded, kernel, mode="valid"),
+    # Match GPU arithmetic: bright-source roundoff must not change faint-pixel
+    # threshold decisions when the image is processed in larger tiles.
+    padded = np.pad(pixels.astype(np.float64), radius, mode="symmetric")
+    filtered = np.array(fftconvolve(padded, kernel.astype(np.float64), mode="valid"),
                         dtype=np.float32, order="C", copy=True)
     if not np.isfinite(filtered).all():
         raise FloatingPointError("FFT filtering produced nonfinite pixel values")
@@ -43,7 +45,7 @@ def _smooth_cpu(data: np.ndarray, kernel_sigma: float) -> np.ndarray:
 
 
 def _smooth_gpu(data: np.ndarray, kernel_sigma: float) -> np.ndarray:
-    """Equivalent CuPy FFT convolution (cuFFT on NVIDIA), returning NumPy."""
+    """CuPy/cuFFT convolution with float64 arithmetic and float32 output."""
     pixels, kernel, radius = _filter_input(data, kernel_sigma)
     try:
         import cupy as cp
@@ -54,10 +56,13 @@ def _smooth_gpu(data: np.ndarray, kernel_sigma: float) -> np.ndarray:
             "node's CUDA runtime"
         ) from error
 
-    device_pixels = cp.asarray(pixels)
-    device_kernel = cp.asarray(kernel)
+    # Large float32 FFTs spread bright-source roundoff into faint pixels and
+    # can move them across the detection cutoff. Widen on device after the
+    # float32 upload; retain the shared kernel and round only the final image.
+    device_pixels = cp.asarray(pixels).astype(cp.float64)
+    device_kernel = cp.asarray(kernel, dtype=cp.float64)
     padded = cp.pad(device_pixels, radius, mode="symmetric")
-    filtered = fftconvolve(padded, device_kernel, mode="valid")
+    filtered = fftconvolve(padded, device_kernel, mode="valid").astype(cp.float32)
     # asnumpy blocks for the result: callers receive completed host pixels.
     result = np.array(cp.asnumpy(filtered), dtype=np.float32, order="C", copy=True)
     if not np.isfinite(result).all():
@@ -70,8 +75,9 @@ def smooth(data: np.ndarray, kernel_sigma: float, backend: str = "cpu", *,
            ) -> np.ndarray:
     """Return an independent float32 image using the shared backend names.
 
-    Inputs must be finite and nonempty. Both backends use radius ceil(4*sigma)
-    and reflected edges. GPU errors propagate; there is no CPU fallback.
+    Inputs must be finite and nonempty. Both backends use float64 transforms,
+    radius ceil(4*sigma), and reflected edges, then return float32 pixels.
+    GPU errors propagate; there is no CPU fallback.
     """
     if backend not in ("cpu", "gpu"):
         raise ValueError(f"unknown backend {backend!r}")

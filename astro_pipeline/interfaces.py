@@ -38,7 +38,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Literal, TypedDict
 import numpy as np
 
-INTERFACE_VERSION = 4
+INTERFACE_VERSION = 5
 
 # Fixed catalog schema (column order matters for CSV output).
 CATALOG_COLUMNS = [
@@ -88,8 +88,9 @@ BENCHMARK_SPEEDUP_COMPARISONS = (
 class BenchmarkTimings(TypedDict):
     """One benchmark configuration's median wall times, in seconds.
 
-    GPU substage values are None for CPU-only runs. They are breakdowns of the
-    filter stage, not additional durations to sum into total.
+    GPU substage values are None for CPU-only runs. They break down GPU work
+    (filtering in staged mode, all numerical stages in full-GPU mode) and are
+    not additional durations to sum into total.
     """
 
     io: float
@@ -179,3 +180,4 @@ class DetectionParams:
     deblend: bool = True
     deblend_min_separation: int = 3    # pixels between retained peak markers
     deblend_prominence_sigma: float = 1.0  # peak-to-saddle height / pre-filter noise
+    pipeline_backend: str = "staged"  # "gpu" keeps all numerical stages on device

@@ -4,6 +4,8 @@
 #include <stdexcept>
 #include <cstdint>
 #include <vector>
+#include <functional>
+#include <utility>
 
 namespace astro_background {
 
@@ -29,10 +31,17 @@ struct Diagnostics {
     std::size_t ny = 0, nx = 0;
 };
 
+// Optional per-image global-statistics provider. Null inputs request bootstrap
+// statistics of the observed image; otherwise exclude source pixels and use
+// float64(image) - float32(background). Mesh statistics remain native CPU work.
+using GlobalStatistics = std::function<std::pair<double, double>(
+    const float* background, const std::uint8_t* source)>;
+
 double estimate(const float* pixels, std::size_t height, std::size_t width,
                 std::size_t row_stride, std::size_t box, std::size_t threads,
                 float* background, Timings* timings = nullptr,
                 const bool* valid_mask = nullptr, bool refine = true,
-                Diagnostics* diagnostics = nullptr);
+                Diagnostics* diagnostics = nullptr,
+                const GlobalStatistics& global_statistics = {});
 
 } // namespace astro_background
