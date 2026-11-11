@@ -4,7 +4,6 @@
 #include <cmath>
 #include <limits>
 #include <numeric>
-#include <queue>
 #include <stdexcept>
 #include <tuple>
 
@@ -73,29 +72,48 @@ struct Later {
         return std::tie(a.level, a.sequence) > std::tie(b.level, b.sequence);
     }
 };
-std::vector<std::int32_t> watershed(const std::vector<float>& values, const Mask& region,
-                                   std::size_t h, std::size_t w,
-                                   const std::vector<std::size_t>& seeds) {
-    std::vector<std::int32_t> owners(region.size(), 0);
-    std::priority_queue<Event, std::vector<Event>, Later> queue;
+struct Workspace {
+    Mask pending;
+    std::vector<Event> heap;
+    std::vector<std::size_t> areas, retained;
+};
+void watershed(const std::vector<float>& values, const Mask& region,
+               std::size_t h, std::size_t w, const std::vector<std::size_t>& seeds,
+               std::vector<std::int32_t>& owners, Workspace& work, DeblendProfile* profile) {
+    owners.assign(region.size(), 0);
+    work.pending.assign(region.size(), 0);
+    work.heap.clear();
     std::size_t sequence = 0;
+    auto push = [&](Event event) {
+        work.pending[event.pixel] = 1;
+        work.heap.push_back(event);
+        std::push_heap(work.heap.begin(), work.heap.end(), Later{});
+        if (profile) {
+            ++profile->queue_pushes;
+            profile->queue_peak = std::max(profile->queue_peak, work.heap.size());
+        }
+    };
     for (std::size_t i = 0; i < seeds.size(); ++i) {
         owners[seeds[i]] = static_cast<std::int32_t>(i + 1);
-        queue.push(Event{-static_cast<double>(values[seeds[i]]), sequence++, seeds[i], owners[seeds[i]], true});
+        push(Event{-static_cast<double>(values[seeds[i]]), sequence++, seeds[i], owners[seeds[i]], true});
     }
-    while (!queue.empty()) {
-        const auto event = queue.top(); queue.pop();
+    while (!work.heap.empty()) {
+        const auto event = work.heap.front();
+        std::pop_heap(work.heap.begin(), work.heap.end(), Later{});
+        work.heap.pop_back();
+        if (profile) ++profile->queue_pops;
         if (!event.seed) {
-            if (owners[event.pixel]) continue;
             owners[event.pixel] = event.owner;
         }
         neighbors(event.pixel, h, w, [&](auto q) {
-            if (region[q] && !owners[q])
-                queue.push(Event{std::max(event.level, -static_cast<double>(values[q])),
-                                 sequence++, q, event.owner, false});
+            // Path levels never decrease. The first queued event wins both
+            // priority and FIFO ties; later events cannot improve it. Ownership
+            // still changes only on pop, and marker pixels remain protected.
+            if (region[q] && !work.pending[q])
+                push(Event{std::max(event.level, -static_cast<double>(values[q])),
+                           sequence++, q, event.owner, false});
         });
     }
-    return owners;
 }
 struct Group {
     std::size_t h = 0, w = 0, children = 0;
@@ -165,7 +183,7 @@ DetectionResult detect(const float* residual, const float* filtered, const bool*
                        std::size_t h, std::size_t w, double threshold,
                        std::size_t min_area, bool deblend, std::size_t separation,
                        double prominence, std::size_t threads,
-                       const float* peak_image, std::size_t centroid_radius) {
+                       const float* peak_image, std::size_t centroid_radius, bool profile) {
     const auto started = Clock::now();
     if (!h || !w || !threads || !min_area || !separation || !centroid_radius || !std::isfinite(threshold) || threshold < 0 ||
             !std::isfinite(prominence) || prominence <= 0 || h > std::numeric_limits<std::size_t>::max() / w)
@@ -184,9 +202,19 @@ DetectionResult detect(const float* residual, const float* filtered, const bool*
     result.timings.label_ms = ms(started);
     auto phase = Clock::now();
     std::vector<Group> groups(parents.size());
-    workers.run(parents.size(), [&](auto, auto begin, auto end) {
+    std::vector<Workspace> workspace(workers.size());
+    if (profile) result.deblend_components.resize(parents.size());
+    workers.run(parents.size(), [&](auto worker, auto begin, auto end) {
+        auto& work = workspace[worker];
         for (auto i = begin; i < end; ++i) {
             auto& parent = parents[i]; auto& group = groups[i];
+            auto* detail = profile ? &result.deblend_components[i] : nullptr;
+            const auto started_group = detail ? Clock::now() : Clock::time_point{};
+            if (detail) {
+                detail->x0 = parent.x0; detail->y0 = parent.y0;
+                detail->x1 = parent.x1; detail->y1 = parent.y1;
+                detail->pixels = parent.pixels.size();
+            }
             std::sort(parent.pixels.begin(), parent.pixels.end());
             group.h = parent.y1 - parent.y0 + 1; group.w = parent.x1 - parent.x0 + 1;
             Mask region(group.h * group.w, 0);
@@ -195,18 +223,39 @@ DetectionResult detect(const float* residual, const float* filtered, const bool*
                 const auto q = (p / w - parent.y0) * group.w + p % w - parent.x0;
                 region[q] = 1; values[q] = peak_image ? peak_image[p] : filtered[p];
             }
+            if (detail) detail->prepare_ms = ms(started_group);
+            const auto marker_start = detail ? Clock::now() : Clock::time_point{};
             auto seeds = deblend ? markers(values, region, group.h, group.w, prominence, separation) : std::vector<std::size_t>{};
+            if (detail) {
+                detail->marker_ms = ms(marker_start);
+                detail->markers = seeds.size();
+            }
             if (seeds.size() <= 1) {
                 group.labels.assign(region.begin(), region.end()); group.children = 1;
             } else for (;;) {
-                group.labels = watershed(values, region, group.h, group.w, seeds);
-                std::vector<std::size_t> areas(seeds.size() + 1, 0), retained;
-                for (auto owner : group.labels) ++areas[static_cast<std::size_t>(owner)];
-                for (std::size_t j = 0; j < seeds.size(); ++j) if (areas[j + 1] >= min_area) retained.push_back(seeds[j]);
-                if (retained.size() == seeds.size()) { group.children = seeds.size(); group.peaks = seeds; break; }
-                if (retained.empty()) retained.push_back(*std::min_element(seeds.begin(), seeds.end(), [&](auto a, auto b) { return values[a] > values[b] || (values[a] == values[b] && a < b); }));
-                seeds = std::move(retained);
+                const auto flood_start = detail ? Clock::now() : Clock::time_point{};
+                watershed(values, region, group.h, group.w, seeds, group.labels, work, detail);
+                if (detail) {
+                    ++detail->passes;
+                    detail->watershed_ms += ms(flood_start);
+                }
+                const auto prune_start = detail ? Clock::now() : Clock::time_point{};
+                work.areas.assign(seeds.size() + 1, 0);
+                work.retained.clear();
+                for (auto owner : group.labels) ++work.areas[static_cast<std::size_t>(owner)];
+                for (std::size_t j = 0; j < seeds.size(); ++j)
+                    if (work.areas[j + 1] >= min_area) work.retained.push_back(seeds[j]);
+                const bool complete = work.retained.size() == seeds.size();
+                if (!complete && work.retained.empty())
+                    work.retained.push_back(*std::min_element(seeds.begin(), seeds.end(), [&](auto a, auto b) { return values[a] > values[b] || (values[a] == values[b] && a < b); }));
+                if (detail) detail->pruning_ms += ms(prune_start);
+                if (complete) { group.children = seeds.size(); group.peaks = seeds; break; }
+                seeds.swap(work.retained);
                 if (seeds.size() == 1) { group.labels.assign(region.begin(), region.end()); group.children = 1; break; }
+            }
+            if (detail) {
+                detail->children = group.children;
+                detail->total_ms = ms(started_group);
             }
         }
     });
