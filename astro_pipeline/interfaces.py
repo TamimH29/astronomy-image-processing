@@ -35,9 +35,10 @@ CONVENTIONS (read these first)
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
+from typing import Literal, TypedDict
 import numpy as np
 
-INTERFACE_VERSION = 3
+INTERFACE_VERSION = 5
 
 # Fixed catalog schema (column order matters for CSV output).
 CATALOG_COLUMNS = [
@@ -47,6 +48,88 @@ CATALOG_COLUMNS = [
     "area_pix",                       # number of pixels above threshold
     "flux",                           # background-subtracted integrated flux
 ]
+
+# Timing keys are kept in report/CLI order. `total` is an end-to-end wall
+# time and is not expected to equal the sum of stages when work overlaps.
+BENCHMARK_STAGE_KEYS = (
+    "io",
+    "background",
+    "tile",
+    "filter",
+    "detect",
+    "merge",
+    "write",
+)
+BENCHMARK_GPU_TIMING_KEYS = ("gpu_h2d", "gpu_compute", "gpu_d2h")
+BENCHMARK_TIMING_KEYS = (
+    *BENCHMARK_STAGE_KEYS,
+    *BENCHMARK_GPU_TIMING_KEYS,
+    "total",
+)
+BENCHMARK_SPEEDUP_KEYS = (*BENCHMARK_STAGE_KEYS, "total")
+
+BenchmarkTier = Literal[
+    "single_core_cpu",
+    "multicore_cpu",
+    "multicore_gpu",
+]
+BENCHMARK_TIER_KEYS: tuple[BenchmarkTier, ...] = (
+    "single_core_cpu",
+    "multicore_cpu",
+    "multicore_gpu",
+)
+BENCHMARK_SPEEDUP_COMPARISONS = (
+    "multicore_vs_single_core",
+    "multicore_gpu_vs_multicore",
+    "multicore_gpu_vs_single_core",
+)
+
+
+class BenchmarkTimings(TypedDict):
+    """One benchmark configuration's median wall times, in seconds.
+
+    GPU substage values are None for CPU-only runs. They break down GPU work
+    (filtering in staged mode, all numerical stages in full-GPU mode) and are
+    not additional durations to sum into total.
+    """
+
+    io: float
+    background: float
+    tile: float
+    filter: float
+    detect: float
+    merge: float
+    write: float
+    gpu_h2d: float | None
+    gpu_compute: float | None
+    gpu_d2h: float | None
+    total: float
+
+
+@dataclass
+class BenchmarkRun:
+    """Median timings and execution metadata for one benchmark tier."""
+
+    tier: BenchmarkTier
+    node_type: str
+    n_workers: int
+    repeat_count: int
+    median_timings_s: BenchmarkTimings
+    gpu_warmup_s: float | None = None
+
+
+@dataclass
+class BenchmarkComparison:
+    """Three-tier runs and per-stage speedups for a benchmark campaign.
+
+    `speedups` is keyed by BENCHMARK_SPEEDUP_COMPARISONS, then by
+    BENCHMARK_SPEEDUP_KEYS. Values are baseline seconds divided by comparison
+    seconds: multicore/single-core, GPU/multicore, and GPU/single-core.
+    Undefined ratios are represented by None.
+    """
+
+    runs: dict[BenchmarkTier, BenchmarkRun]
+    speedups: dict[str, dict[str, float | None]]
 
 
 @dataclass
@@ -97,3 +180,4 @@ class DetectionParams:
     deblend: bool = True
     deblend_min_separation: int = 3    # pixels between retained peak markers
     deblend_prominence_sigma: float = 1.0  # peak-to-saddle height / pre-filter noise
+    pipeline_backend: str = "staged"  # "gpu" keeps all numerical stages on device
