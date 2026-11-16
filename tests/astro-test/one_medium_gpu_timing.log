@@ -1,0 +1,7 @@
+/work/11301/thasan/vista/venvs/astro-pipeline/lib/python3.11/site-packages/cupyx/jit/_interface.py:247: FutureWarning: cupyx.jit.rawkernel is experimental. The interface can change in the future.
+  cupy._util.experimental('cupyx.jit.rawkernel')
+10 images, 238 sources -> /work/11301/thasan/vista/astro-test/one_medium_gpu.csv
+
+real	0m1.825s
+user	0m1.276s
+sys	0m0.446s
