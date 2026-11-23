@@ -7,7 +7,7 @@ Per-stage timings are collected separately by stage_timing.py and are explicitly
 single-process diagnostics, not timings for the multicore worker pool.
 
 Example on a Vista GH node (from the repository root):
-  python scripts/compare_performance_nsys.py \
+  python final_scripts/compare_performance_nsys.py \
       --input 'gen_fits/large/*.fits' --cpu-workers 20 --tile-size 1024 \
       --repeats 5 --results-dir "$WORK/astro-test/nsys-large"
 
@@ -43,10 +43,16 @@ def _input_paths(spec: str) -> list[str]:
 
 
 def _available_cpus() -> int:
+    slurm_count = os.environ.get("SLURM_CPUS_PER_TASK")
+    if slurm_count:
+        try:
+            return max(1, int(slurm_count))
+        except ValueError:
+            pass
     try:
-        return len(os.sched_getaffinity(0))
+        return max(1, len(os.sched_getaffinity(0)))
     except AttributeError:
-        return os.cpu_count() or 1
+        return max(1, os.cpu_count() or 1)
 
 
 def _pipeline_command(args: argparse.Namespace, workers: int, backend: str,
@@ -305,11 +311,11 @@ def _ratio(base: float | None, compared: float | None) -> float | None:
     return base / compared
 
 
-def main() -> None:
+def main(selected_tier: str | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, help="FITS directory, file, or glob")
-    parser.add_argument("--cpu-workers", required=True, type=int,
-                        help="worker count for multicore CPU and CPU+GPU tiers")
+    parser.add_argument("--cpu-workers", type=int, default=None,
+                        help="worker count; standalone scripts default to the allocated CPU count")
     parser.add_argument("--results-dir", required=True, type=Path)
     parser.add_argument("--tile-size", type=int, default=None)
     parser.add_argument("--repeats", type=int, default=5,
@@ -322,8 +328,14 @@ def main() -> None:
     parser.add_argument("--no-deblend", action="store_true")
     args = parser.parse_args()
 
-    if args.cpu_workers < 1 or args.repeats < 1:
-        parser.error("--cpu-workers and --repeats must be positive")
+    if args.repeats < 1:
+        parser.error("--repeats must be positive")
+    if args.cpu_workers is not None and args.cpu_workers < 1:
+        parser.error("--cpu-workers must be positive")
+    if selected_tier is None and args.cpu_workers is None:
+        parser.error("--cpu-workers is required when comparing all tiers")
+    if selected_tier == "single_core_cpu" and args.cpu_workers not in (None, 1):
+        parser.error("the single-core script always uses exactly one worker")
     if args.tile_size is not None and args.tile_size < 1:
         parser.error("--tile-size must be positive")
     paths = _input_paths(args.input)
@@ -336,16 +348,26 @@ def main() -> None:
         parser.error(f"results directory is not empty: {args.results_dir}; choose a new directory")
     args.results_dir.mkdir(parents=True, exist_ok=True)
 
+    cpu_workers = args.cpu_workers or _available_cpus()
     max_cpus = _available_cpus()
     # run_batch warns when workers exceed the CPU affinity, but its actual
     # process count is capped by the number of input files.
-    effective_workers = min(args.cpu_workers, len(paths))
-    if args.cpu_workers > max_cpus:
-        print(f"warning: requested {args.cpu_workers} workers but only {max_cpus} CPUs are available")
-    if args.cpu_workers > len(paths):
-        print(f"note: {len(paths)} files limit run_batch to at most {len(paths)} workers")
-    print(f"inputs: {len(paths)}; requested multicore workers: {args.cpu_workers}; "
-          f"expected effective workers: {effective_workers}")
+    effective_workers = min(cpu_workers, len(paths))
+    if selected_tier is not None:
+        active_workers = 1 if selected_tier == "single_core_cpu" else cpu_workers
+        if active_workers > max_cpus:
+            print(f"warning: requested {active_workers} workers but only {max_cpus} CPUs are available")
+        if active_workers > len(paths):
+            print(f"note: {len(paths)} files limit run_batch to at most {len(paths)} workers")
+        print(f"inputs: {len(paths)}; tier: {selected_tier}; requested workers: {active_workers}; "
+              f"expected effective workers: {min(active_workers, len(paths))}")
+    else:
+        if cpu_workers > max_cpus:
+            print(f"warning: requested {cpu_workers} workers but only {max_cpus} CPUs are available")
+        if cpu_workers > len(paths):
+            print(f"note: {len(paths)} files limit run_batch to at most {len(paths)} workers")
+        print(f"inputs: {len(paths)}; requested multicore workers: {cpu_workers}; "
+              f"expected effective workers: {effective_workers}")
     nsys_version = subprocess.run(
         [nsys, "--version"], check=True, text=True, capture_output=True
     ).stdout.strip()
@@ -353,15 +375,20 @@ def main() -> None:
     perf = shutil.which("perf")
     print(f"perf: {'available' if perf else 'not found (CPU counters will be empty)'}")
 
-    configurations = [
-        ("single_core_cpu", 1, "staged"),
-        ("multicore_cpu", args.cpu_workers, "staged"),
-        ("multicore_gpu", args.cpu_workers, "gpu"),
-    ]
+    if selected_tier is None:
+        configurations = [
+            ("single_core_cpu", 1, "staged"),
+            ("multicore_cpu", cpu_workers, "staged"),
+            ("multicore_gpu", cpu_workers, "gpu"),
+        ]
+    else:
+        workers = 1 if selected_tier == "single_core_cpu" else cpu_workers
+        backend = "gpu" if selected_tier == "multicore_gpu" else "staged"
+        configurations = [(selected_tier, workers, backend)]
     summaries = []
     for tier, workers, pipeline_backend in configurations:
-        tier_dir = args.results_dir / tier
-        tier_dir.mkdir()
+        tier_dir = args.results_dir if selected_tier else args.results_dir / tier
+        tier_dir.mkdir(parents=True)
         samples = []
         perf_metrics = None
         for repeat in range(args.repeats):
@@ -424,16 +451,12 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(summaries)
 
-    by_tier = {row["tier"]: row for row in summaries}
-    cpu1 = by_tier["single_core_cpu"]["median_wall_s"]
-    cpum = by_tier["multicore_cpu"]["median_wall_s"]
-    gpum = by_tier["multicore_gpu"]["median_wall_s"]
     comparison = {
-        "speedups_from_unprofiled_median_wall_time": {
-            "multicore_cpu_vs_single_core_cpu": _ratio(cpu1, cpum),
-            "multicore_gpu_vs_multicore_cpu": _ratio(cpum, gpum),
-            "multicore_gpu_vs_single_core_cpu": _ratio(cpu1, gpum),
-        },
+        "tier_results": {row["tier"]: {
+            "median_wall_s": row["median_wall_s"],
+            "workers_requested": row["workers_requested"],
+            "workers_effective": row["workers_effective"],
+        } for row in summaries},
         "nsys_metrics_note": (
             "GPU kernel and memcpy sums aggregate activity durations across workers; "
             "they may exceed elapsed wall time when activities overlap. "
@@ -447,6 +470,21 @@ def main() -> None:
             "multicore worker-stage aggregates. Per-kernel occupancy requires Nsight Compute."
         ),
     }
+    if selected_tier is None:
+        by_tier = {row["tier"]: row for row in summaries}
+        cpu1 = by_tier["single_core_cpu"]["median_wall_s"]
+        cpum = by_tier["multicore_cpu"]["median_wall_s"]
+        gpum = by_tier["multicore_gpu"]["median_wall_s"]
+        comparison["speedups_from_unprofiled_median_wall_time"] = {
+            "multicore_cpu_vs_single_core_cpu": _ratio(cpu1, cpum),
+            "multicore_gpu_vs_multicore_cpu": _ratio(cpum, gpum),
+            "multicore_gpu_vs_single_core_cpu": _ratio(cpu1, gpum),
+        }
+    else:
+        comparison["note"] = (
+            "This report contains one tier. Run the other standalone tier scripts "
+            "with the same input and settings to compare their median wall times."
+        )
     (args.results_dir / "comparison.json").write_text(
         json.dumps(comparison, indent=2) + "\n", encoding="utf-8")
     print("\nMedian unprofiled wall times and collected diagnostics:")

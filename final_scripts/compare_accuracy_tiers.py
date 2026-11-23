@@ -6,7 +6,7 @@ truth files exist (*.truth.json), each tier is scored against them. A separate
 single-image diagnostic pass compares intermediate CPU/GPU arrays and masks.
 
 Example on Vista (from the repository root):
-  python scripts/compare_accuracy_tiers.py \
+  python final_scripts/compare_accuracy_tiers.py \
       --input 'gen_fits/large/*.fits' --cpu-workers 20 --tile-size 1024 \
       --results-dir "$WORK/astro-test/accuracy-large"
 
@@ -22,8 +22,13 @@ import json
 import math
 import os
 import statistics
+import sys
 from dataclasses import asdict
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import numpy as np
 
