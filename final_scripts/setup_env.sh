@@ -8,9 +8,9 @@
 #    so this loads the newest gcc module whose major version is <= 14
 #    (override with   PS4_GCC=gcc/13.2.0 source setup_env.sh).
 #    Fallbacks: the system g++ via -ccbin, then -allow-unsupported-compiler.
-# 3. Finds Nsight Compute (ncu) and Nsight Systems (nsys).  With the NVHPC CUDA
-#    module they are not on PATH; they live in the sibling profilers/ folder.
-# Used by ps4.slurm and ps4_profile.slurm; run it by hand before `make build`.
+# 3. Finds Nsight Compute (ncu) and Nsight Systems (nsys). With the Vista
+#    NVHPC modules, the Arm SBSA executable may be directly under a
+#    target-linux-sbsa-armv8 directory rather than a bin/ directory.
 
 _ps4_major() { "$1" -dumpversion 2>/dev/null | cut -d. -f1; }
 
@@ -48,13 +48,11 @@ if [ -n "$_ps4_nvcc" ]; then
     _ps4_sdk=$(dirname "$(dirname "$_ps4_cudadir")")                # .../25.3
     for _ps4_tool in ncu nsys; do
         command -v "$_ps4_tool" >/dev/null 2>&1 && continue
-        case $_ps4_tool in
-            ncu)  _ps4_pat='*ompute*/ncu' ;;
-            nsys) _ps4_pat='*ystems*/bin/nsys' ;;
-        esac
-        # shallowest match wins (the launcher, not the per-target binary); newest version on ties
+        # The Nsight Systems Arm SBSA launcher is commonly named `nsys` at
+        # target-linux-sbsa-armv8/nsys (no bin/ component). Search by filename
+        # so both that layout and the conventional bin/nsys layout work.
         _ps4_found=$(find "$_ps4_sdk/profilers" "$_ps4_sdk/cuda" "$_ps4_cudadir" \
-                          -maxdepth 5 -type f -path "$_ps4_pat" 2>/dev/null \
+                          -maxdepth 8 -type f -name "$_ps4_tool" -executable 2>/dev/null \
                      | awk -F/ '{print NF" "$0}' | sort -k1,1n -k2,2Vr | head -1 | cut -d' ' -f2-)
         if [ -n "$_ps4_found" ]; then
             export PATH="$(dirname "$_ps4_found"):$PATH"
@@ -68,4 +66,4 @@ fi
 echo "[setup_env] host compiler: $(gcc --version 2>&1 | head -1)"
 echo "[setup_env] nvcc command : ${NVCC:-nvcc}"
 echo "[setup_env] ncu: $(command -v ncu || echo missing)   nsys: $(command -v nsys || echo missing)"
-unset _ps4_gcc_mod _ps4_nvcc _ps4_cudadir _ps4_sdk _ps4_tool _ps4_pat _ps4_found
+unset _ps4_gcc_mod _ps4_nvcc _ps4_cudadir _ps4_sdk _ps4_tool _ps4_found
