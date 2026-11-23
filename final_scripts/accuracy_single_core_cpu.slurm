@@ -29,8 +29,9 @@ INPUT_COUNT=$(find "$INPUT_DIR" -maxdepth 1 -type f \( -name '*.fits' -o -name '
 mkdir -p "$(dirname "$RESULTS_DIR")"
 
 module reset
-module load python3
 source "$PROJECT_DIR/final_scripts/setup_env.sh"
+# Load Python after setup_env selects the compiler/CUDA module versions it needs.
+module load python3
 source "$WORK/venvs/astro-pipeline/bin/activate"
 module list 2>&1
 python -c 'import numpy, scipy, astropy; print("CPU Python dependencies OK")'
