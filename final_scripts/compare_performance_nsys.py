@@ -233,13 +233,13 @@ def _sum_event_table(db: sqlite3.Connection, table: str) -> tuple[int, float, in
 
 
 def _nsys_metrics(nsys: str, report: Path) -> dict:
+    db_path = report.with_suffix(".sqlite")
     export = subprocess.run(
-        [nsys, "export", "--type=sqlite", str(report)],
+        [nsys, "export", "--type=sqlite", "--output", str(db_path), str(report)],
         text=True, capture_output=True,
     )
     if export.returncode:
         raise RuntimeError(f"nsys export failed for {report}: {export.stderr.strip()}")
-    db_path = report.with_suffix(".sqlite")
     if not db_path.exists():
         raise RuntimeError(f"Nsight export did not create expected database {db_path}")
 
@@ -388,7 +388,7 @@ def main(selected_tier: str | None = None) -> None:
     summaries = []
     for tier, workers, pipeline_backend in configurations:
         tier_dir = args.results_dir if selected_tier else args.results_dir / tier
-        tier_dir.mkdir(parents=True)
+        tier_dir.mkdir(parents=True, exist_ok=True)
         samples = []
         perf_metrics = None
         for repeat in range(args.repeats):
