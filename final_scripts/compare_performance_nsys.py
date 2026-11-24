@@ -388,7 +388,7 @@ def main(selected_tier: str | None = None) -> None:
     summaries = []
     for tier, workers, pipeline_backend in configurations:
         tier_dir = args.results_dir if selected_tier else args.results_dir / tier
-        tier_dir.mkdir(parents=True)
+        tier_dir.mkdir(parents=True, exist_ok=True)
         samples = []
         perf_metrics = None
         for repeat in range(args.repeats):
