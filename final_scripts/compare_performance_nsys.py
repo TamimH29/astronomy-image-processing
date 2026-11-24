@@ -233,15 +233,19 @@ def _sum_event_table(db: sqlite3.Connection, table: str) -> tuple[int, float, in
 
 
 def _nsys_metrics(nsys: str, report: Path) -> dict:
+    db_path = report.with_suffix(".sqlite")
     export = subprocess.run(
-        [nsys, "export", "--type=sqlite", str(report)],
+        [nsys, "export", "--type=sqlite", "--output", str(db_path), str(report)],
         text=True, capture_output=True,
     )
     if export.returncode:
         raise RuntimeError(f"nsys export failed for {report}: {export.stderr.strip()}")
-    db_path = report.with_suffix(".sqlite")
     if not db_path.exists():
-        raise RuntimeError(f"Nsight export did not create expected database {db_path}")
+        detail = "\n".join(part for part in (export.stdout.strip(), export.stderr.strip()) if part)
+        raise RuntimeError(
+            f"Nsight export did not create expected database {db_path}. "
+            f"Nsight output: {detail or '(no output)'}"
+        )
 
     metrics = {
         "gpu_kernel_count": None,
