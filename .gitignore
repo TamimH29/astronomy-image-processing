@@ -6,3 +6,4 @@ build*/
 *.o
 /benchmarks/results/
 /.venv/
+/results/
