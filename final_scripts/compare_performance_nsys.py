@@ -286,11 +286,16 @@ def _nsys_metrics(nsys: str, report: Path) -> dict:
 
 def _run_stage_timing(args: argparse.Namespace, tier_dir: Path, pipeline_backend: str,
                       input_count: int) -> dict:
-    """Collect one-process stage breakdown using the project's existing profiler."""
+    """Collect a small one-process stage sample using the existing profiler.
+
+    Stage timings are diagnostic only. Sampling five files once avoids repeating
+    the full final dataset serially after the end-to-end benchmark has completed.
+    """
     timing_dir = tier_dir / "stage_timing_single_process"
+    sample_count = min(input_count, 5)
     command = [
         sys.executable, "scripts/stage_timing.py", "--input", args.input,
-        "--limit", str(input_count), "--repeats", str(args.repeats),
+        "--limit", str(sample_count), "--repeats", "1",
         "--tile-sizes", "none" if args.tile_size is None else str(args.tile_size),
         "--backend", "cpu", "--pipeline-backend", pipeline_backend,
         "--workers", "1", "--results-dir", str(timing_dir),
@@ -322,7 +327,7 @@ def main(selected_tier: str | None = None) -> None:
                         help="worker count; standalone scripts default to the allocated CPU count")
     parser.add_argument("--results-dir", required=True, type=Path)
     parser.add_argument("--tile-size", type=int, default=None)
-    parser.add_argument("--repeats", type=int, default=5,
+    parser.add_argument("--repeats", type=int, default=3,
                         help="unprofiled repetitions per tier; report median wall time")
     parser.add_argument("--kernel-sigma", type=float, default=2.0)
     parser.add_argument("--threshold-sigma", type=float, default=3.0)
@@ -398,9 +403,11 @@ def main(selected_tier: str | None = None) -> None:
         for repeat in range(args.repeats):
             output = tier_dir / f"catalog_repeat_{repeat + 1}.csv"
             command = _pipeline_command(args, workers, pipeline_backend, output)
+            print(f"[{tier}] unprofiled run {repeat + 1}/{args.repeats}", flush=True)
             elapsed = _run_logged(command, tier_dir / f"run_repeat_{repeat + 1}.log", timed=True)
             samples.append(elapsed)
         # One independent hardware-counter run; it is not used for headline timing.
+        print(f"[{tier}] collecting perf counters", flush=True)
         perf_metrics = _run_perf(perf, _pipeline_command(
             args, workers, pipeline_backend, tier_dir / "catalog_perf.csv"), tier_dir,
             statistics.median(samples), min(workers, len(paths)))
@@ -418,6 +425,7 @@ def main(selected_tier: str | None = None) -> None:
             *pipeline_command,
         ]
         try:
+            print(f"[{tier}] profiling all {len(paths)} inputs with Nsight Systems", flush=True)
             profile_wall = _run_logged(profile_command, tier_dir / "nsys_profile.log", timed=True)
             gpu_metrics_status = "collected" if collect_gpu_metrics else "not applicable to CPU tier"
         except subprocess.CalledProcessError:
@@ -432,6 +440,7 @@ def main(selected_tier: str | None = None) -> None:
         if not report.exists():
             raise RuntimeError(f"Nsight Systems did not create expected report: {report}")
         metrics = _nsys_metrics(nsys, report)
+        print(f"[{tier}] collecting stage timings from {min(len(paths), 5)} inputs", flush=True)
         stage_timings = _run_stage_timing(args, tier_dir, pipeline_backend, len(paths))
         summaries.append({
             "tier": tier,

@@ -13,7 +13,7 @@
 #SBATCH -N 1
 #SBATCH -n 1
 #SBATCH -c 72
-#SBATCH -t 08:00:00
+#SBATCH -t 24:00:00
 
 set -eo pipefail
 PROJECT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
@@ -21,7 +21,9 @@ cd "$PROJECT_DIR"
 : "${WORK:?WORK is not set; use a TACC shell with WORK configured}"
 INPUT_DIR="${INPUT_DIR:-$PROJECT_DIR/100_image_synth}"
 RESULTS_DIR="${RESULTS_DIR:-$WORK/astro-test/performance-multicore-gpu-${SLURM_JOB_ID:-manual}}"
-REPEATS="${REPEATS:-5}"
+# Three complete unprofiled runs provide a median without making the expensive
+# 100-image GPU profiling job unnecessarily long. Override with --export=ALL,REPEATS=N.
+REPEATS="${REPEATS:-3}"
 
 [[ -d "$INPUT_DIR" ]] || { echo "Input directory not found: $INPUT_DIR" >&2; exit 1; }
 INPUT_COUNT=$(find "$INPUT_DIR" -maxdepth 1 -type f \( -name '*.fits' -o -name '*.fits.gz' -o -name '*.fits.bz2' -o -name '*.fit' \) | wc -l)
@@ -39,6 +41,6 @@ nvidia-smi
 command -v nsys >/dev/null 2>&1 || { echo "Nsight Systems (nsys) is required; see final_scripts/setup_env.sh" >&2; exit 1; }
 
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
-python final_scripts/compare_performance_gpu.py \
+python -u final_scripts/compare_performance_gpu.py \
     --input "$INPUT_DIR" --cpu-workers "$SLURM_CPUS_PER_TASK" --tile-size 1024 --repeats "$REPEATS" \
     --results-dir "$RESULTS_DIR"
