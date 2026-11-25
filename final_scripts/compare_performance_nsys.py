@@ -5,6 +5,8 @@ captures one Nsight Systems trace per tier for CUDA kernel, transfer, API, and
 sampled GPU metrics. If Linux perf is available, it also records CPU counters.
 Per-stage timings are collected separately by stage_timing.py and are explicitly
 single-process diagnostics, not timings for the multicore worker pool.
+GPU tiers also run a separate Nsight Compute pass over every kernel, collecting
+SpeedOfLight, Occupancy, and LaunchStats into binary and plain-text reports.
 
 Example on a Vista GH node (from the repository root):
   python final_scripts/compare_performance_nsys.py \
@@ -286,16 +288,11 @@ def _nsys_metrics(nsys: str, report: Path) -> dict:
 
 def _run_stage_timing(args: argparse.Namespace, tier_dir: Path, pipeline_backend: str,
                       input_count: int) -> dict:
-    """Collect a small one-process stage sample using the existing profiler.
-
-    Stage timings are diagnostic only. Sampling five files once avoids repeating
-    the full final dataset serially after the end-to-end benchmark has completed.
-    """
+    """Collect one-process stage breakdown using the project's existing profiler."""
     timing_dir = tier_dir / "stage_timing_single_process"
-    sample_count = min(input_count, 5)
     command = [
         sys.executable, "scripts/stage_timing.py", "--input", args.input,
-        "--limit", str(sample_count), "--repeats", "1",
+        "--limit", str(input_count), "--repeats", str(args.repeats),
         "--tile-sizes", "none" if args.tile_size is None else str(args.tile_size),
         "--backend", "cpu", "--pipeline-backend", pipeline_backend,
         "--workers", "1", "--results-dir", str(timing_dir),
@@ -320,6 +317,34 @@ def _ratio(base: float | None, compared: float | None) -> float | None:
     return base / compared
 
 
+def _run_speed_of_light(ncu: str, args: argparse.Namespace, tier_dir: Path,
+                        workers: int) -> None:
+    """Profile every GPU kernel in a separate, untimed production execution."""
+    output = tier_dir / "speed-of-light"
+    output.mkdir(parents=True, exist_ok=True)
+    report = output / "profile.ncu-rep"
+    command = _pipeline_command(args, workers, "gpu", output / "catalog.csv")
+    env = dict(os.environ, NV_COMPUTE_PROFILER_DISABLE_STOCK_FILE_DEPLOYMENT="1")
+    print("Collecting Speed of Light, occupancy, and launch metrics for all GPU kernels. "
+          "Kernel replay can substantially extend profiling time; benchmark timings are separate.",
+          flush=True)
+    with (output / "profile.log").open("w", encoding="utf-8") as log:
+        subprocess.run(
+            [ncu, "--target-processes", "all", "--section", "SpeedOfLight",
+             "--section", "Occupancy", "--section", "LaunchStats",
+             "--export", str(report), *command],
+            stdout=log, stderr=subprocess.STDOUT, check=True, env=env,
+        )
+    if not report.is_file():
+        raise RuntimeError(f"Nsight Compute did not create {report}; see {output / 'profile.log'}")
+    with (output / "speed_of_light.txt").open("w", encoding="utf-8") as text:
+        subprocess.run(
+            [ncu, "--import", str(report), "--page", "details"],
+            stdout=text, stderr=subprocess.STDOUT, check=True, env=env,
+        )
+    print(f"Wrote {report} and {output / 'speed_of_light.txt'}", flush=True)
+
+
 def main(selected_tier: str | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, help="FITS directory, file, or glob")
@@ -327,7 +352,7 @@ def main(selected_tier: str | None = None) -> None:
                         help="worker count; standalone scripts default to the allocated CPU count")
     parser.add_argument("--results-dir", required=True, type=Path)
     parser.add_argument("--tile-size", type=int, default=None)
-    parser.add_argument("--repeats", type=int, default=3,
+    parser.add_argument("--repeats", type=int, default=5,
                         help="unprofiled repetitions per tier; report median wall time")
     parser.add_argument("--kernel-sigma", type=float, default=2.0)
     parser.add_argument("--threshold-sigma", type=float, default=3.0)
@@ -353,6 +378,9 @@ def main(selected_tier: str | None = None) -> None:
     nsys = shutil.which("nsys")
     if not nsys:
         parser.error("nsys not found; load/install Nsight Systems on the Vista compute node")
+    ncu = shutil.which("ncu")
+    if selected_tier in (None, "multicore_gpu") and not ncu:
+        parser.error("ncu not found; Nsight Compute is required for GPU Speed of Light profiling")
     if args.results_dir.exists() and any(args.results_dir.iterdir()):
         parser.error(f"results directory is not empty: {args.results_dir}; choose a new directory")
     args.results_dir.mkdir(parents=True, exist_ok=True)
@@ -403,11 +431,9 @@ def main(selected_tier: str | None = None) -> None:
         for repeat in range(args.repeats):
             output = tier_dir / f"catalog_repeat_{repeat + 1}.csv"
             command = _pipeline_command(args, workers, pipeline_backend, output)
-            print(f"[{tier}] unprofiled run {repeat + 1}/{args.repeats}", flush=True)
             elapsed = _run_logged(command, tier_dir / f"run_repeat_{repeat + 1}.log", timed=True)
             samples.append(elapsed)
         # One independent hardware-counter run; it is not used for headline timing.
-        print(f"[{tier}] collecting perf counters", flush=True)
         perf_metrics = _run_perf(perf, _pipeline_command(
             args, workers, pipeline_backend, tier_dir / "catalog_perf.csv"), tier_dir,
             statistics.median(samples), min(workers, len(paths)))
@@ -425,7 +451,6 @@ def main(selected_tier: str | None = None) -> None:
             *pipeline_command,
         ]
         try:
-            print(f"[{tier}] profiling all {len(paths)} inputs with Nsight Systems", flush=True)
             profile_wall = _run_logged(profile_command, tier_dir / "nsys_profile.log", timed=True)
             gpu_metrics_status = "collected" if collect_gpu_metrics else "not applicable to CPU tier"
         except subprocess.CalledProcessError:
@@ -440,7 +465,6 @@ def main(selected_tier: str | None = None) -> None:
         if not report.exists():
             raise RuntimeError(f"Nsight Systems did not create expected report: {report}")
         metrics = _nsys_metrics(nsys, report)
-        print(f"[{tier}] collecting stage timings from {min(len(paths), 5)} inputs", flush=True)
         stage_timings = _run_stage_timing(args, tier_dir, pipeline_backend, len(paths))
         summaries.append({
             "tier": tier,
@@ -510,6 +534,10 @@ def main(selected_tier: str | None = None) -> None:
               f"SM_active_avg={row['gpu_sm_active_avg_pct']}%")
     print(f"\nWrote {args.results_dir / 'summary.csv'} and "
           f"{args.results_dir / 'comparison.json'}")
+    for tier, workers, pipeline_backend in configurations:
+        if pipeline_backend == "gpu":
+            tier_dir = args.results_dir if selected_tier else args.results_dir / tier
+            _run_speed_of_light(ncu, args, tier_dir, workers)
 
 
 if __name__ == "__main__":
