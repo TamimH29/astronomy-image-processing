@@ -16,8 +16,6 @@ export CUPY_CACHE_DIR="${CUPY_CACHE_DIR:-$PROJECT_DIR/benchmarks/results/local-c
 
 [[ -d "$INPUT_DIR" ]] || { echo "Input directory not found: $INPUT_DIR" >&2; exit 1; }
 nsys --version
-command -v ncu >/dev/null || { echo "Nsight Compute (ncu) is required for per-kernel Speed of Light profiling." >&2; exit 1; }
-ncu --version
 python -c 'import numpy, scipy, astropy; import cupy as cp; print("CuPy", cp.__version__, "GPU count:", cp.cuda.runtime.getDeviceCount()); assert cp.cuda.runtime.getDeviceCount() > 0'
 mkdir -p "$RESULTS_DIR"
 
@@ -70,3 +68,4 @@ echo "Benchmark and accuracy results: $RESULTS_DIR"
 echo "Nsight reports: $RESULTS_DIR/performance-*/profile.nsys-rep"
 echo "Speed of Light report: $RESULTS_DIR/performance-gpu/speed-of-light/profile.ncu-rep"
 echo "Speed of Light text: $RESULTS_DIR/performance-gpu/speed-of-light/speed_of_light.txt"
+echo "Speed of Light coverage/status: $RESULTS_DIR/performance-gpu/speed-of-light/coverage.txt"
