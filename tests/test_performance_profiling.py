@@ -13,26 +13,31 @@ from final_scripts import compare_performance_nsys as profiling
 
 
 @pytest.mark.parametrize("selected_tier", [None, "multicore_gpu"])
+@pytest.mark.parametrize("cpu_counters", [False, True])
 def test_wall_clock_mode_needs_no_profilers_and_preserves_pipeline_settings(
-        monkeypatch, tmp_path, selected_tier):
+        monkeypatch, tmp_path, selected_tier, cpu_counters):
     output = tmp_path / "results"
     monkeypatch.setattr(sys, "argv", [
         "compare_performance_nsys.py", "--wall-clock-only", "--input", "real-images",
         "--results-dir", str(output), "--repeats", "3", "--tile-size", "1024",
     ])
+    if cpu_counters:
+        sys.argv.append("--cpu-counters")
     monkeypatch.setattr(profiling, "_input_paths", lambda _: [f"frame-{i}.fits" for i in range(100)])
     monkeypatch.setenv("SLURM_CPUS_PER_TASK", "72")
 
     def forbidden(*args, **kwargs):
         pytest.fail("Wall-clock mode attempted to discover or run diagnostic tools")
 
-    monkeypatch.setattr(profiling.shutil, "which", forbidden)
+    monkeypatch.setattr(profiling.shutil, "which",
+                        lambda name: "perf" if cpu_counters and name == "perf" else forbidden())
     monkeypatch.setattr(profiling.subprocess, "run", forbidden)
     for name in ("_run_perf", "_nsys_metrics", "_run_stage_timing", "_run_speed_of_light"):
         monkeypatch.setattr(profiling, name, forbidden)
     samples = {"single_core_cpu": [8., 4., 6.], "multicore_cpu": [2., 1., 3.],
                "multicore_gpu": [1., .5, .75]}
     calls = []
+    counter_calls = []
 
     def timed(command, log_path, *, timed):
         tier = log_path.parent.name if selected_tier is None else selected_tier
@@ -48,6 +53,14 @@ def test_wall_clock_mode_needs_no_profilers_and_preserves_pipeline_settings(
         return samples[tier].pop(0)
 
     monkeypatch.setattr(profiling, "_run_logged", timed)
+    if cpu_counters:
+        def counters(perf, command, tier_dir, workers):
+            tier = tier_dir.name if selected_tier is None else selected_tier
+            assert sum(t == tier for t, _ in calls) == 3
+            assert Path(command[command.index("--output")+1]).name == "catalog_perf.csv"
+            counter_calls.append(tier)
+            return {"perf_available": True, "perf_wall_s": 99., "cpu_cycles": 1000.}
+        monkeypatch.setattr(profiling, "_run_perf", counters)
     profiling.main(selected_tier)
     with (output / "summary.csv").open() as stream:
         rows = list(csv.DictReader(stream))
@@ -56,16 +69,46 @@ def test_wall_clock_mode_needs_no_profilers_and_preserves_pipeline_settings(
     assert comparison["input_count"] == 100
     assert comparison["tile_size"] == 1024
     assert comparison["repeats"] == 3
+    assert comparison["cpu_counters"] == cpu_counters
     assert len(calls) == (9 if selected_tier is None else 3)
     assert float(rows[-1]["median_wall_s"]) == .75
     assert float(rows[-1]["throughput_images_s"]) == pytest.approx(100/.75)
     assert "profiled_wall_s_diagnostic_only" not in rows[-1]
+    assert len(counter_calls) == ((3 if selected_tier is None else 1) if cpu_counters else 0)
+    if cpu_counters:
+        assert float(rows[-1]["perf_wall_s"]) == 99.
     if selected_tier is None:
         assert comparison["speedups_from_unprofiled_median_wall_time"] == {
             "multicore_cpu_vs_single_core_cpu": 3.,
             "multicore_gpu_vs_multicore_cpu": pytest.approx(2/.75),
             "multicore_gpu_vs_single_core_cpu": 8.,
         }
+
+
+def test_perf_uses_its_own_elapsed_time_and_preserves_unsupported_counters(monkeypatch, tmp_path):
+    def run(command, **kwargs):
+        assert "context-switches,cpu-migrations,page-faults" in command[command.index("-e")+1]
+        Path(command[command.index("-o")+1]).write_text(
+            "400000,msec,task-clock,400000000000,100.00,10.000,CPUs utilized\n"
+            "1000000,,cycles,400000000000,100.00,,\n"
+            "1250000,,instructions,400000000000,100.00,,\n"
+            "<not supported>,,cache-misses,0,100.00,,\n"
+            "1234,,context-switches,400000000000,100.00,,\n"
+            "12,,cpu-migrations,400000000000,100.00,,\n"
+            "5678,,page-faults,400000000000,100.00,,\n")
+        return subprocess.CompletedProcess(command, 0, stderr="")
+    ticks = iter([1000., 1040.])
+    monkeypatch.setattr(profiling.time, "perf_counter", lambda: next(ticks))
+    monkeypatch.setattr(profiling.subprocess, "run", run)
+    result = profiling._run_perf("perf", ["python", "pipeline"], tmp_path, 16)
+    assert result["perf_wall_s"] == 40.
+    assert result["cpu_cores_busy_avg"] == 10.
+    assert result["cpu_utilization_pct_of_workers"] == 62.5
+    assert result["cpu_ipc"] == 1.25
+    assert result["cpu_cache_misses"] is None
+    assert result["cpu_context_switches"] == 1234
+    assert result["cpu_migrations"] == 12
+    assert result["cpu_page_faults"] == 5678
 
 
 def test_systems_normalized_sm_metrics_use_metric_names_and_source_ids():
