@@ -5,8 +5,9 @@ captures one Nsight Systems trace per tier for CUDA kernel, transfer, API, and
 sampled GPU metrics. If Linux perf is available, it also records CPU counters.
 Per-stage timings are collected separately by stage_timing.py and are explicitly
 single-process diagnostics, not timings for the multicore worker pool.
-GPU tiers also run a separate Nsight Compute pass over every kernel, collecting
-SpeedOfLight, Occupancy, and LaunchStats into binary and plain-text reports.
+GPU tiers also sample one invocation per fully qualified GPU kernel in a separate
+single-process Nsight Compute run, collecting SpeedOfLight, Occupancy, and
+LaunchStats with an explicit coverage report.
 
 Example on a Vista GH node (from the repository root):
   python final_scripts/compare_performance_nsys.py \
@@ -183,6 +184,16 @@ def _gpu_sample_metrics(db: sqlite3.Connection) -> dict:
                 return result
     if "GPU_METRICS" in tables:
         columns = _table_columns(db, "GPU_METRICS")
+        if {"typeId", "metricId", "value"}.issubset(columns) and "TARGET_INFO_GPU_METRICS" in tables:
+            count, average, maximum = db.execute(
+                'SELECT COUNT(*), AVG(g.value), MAX(g.value) FROM GPU_METRICS g '
+                'JOIN TARGET_INFO_GPU_METRICS m ON m.typeId=g.typeId AND m.metricId=g.metricId '
+                "WHERE m.metricName IN ('SMs Active [Throughput %]', 'SM Active [Throughput %]')"
+            ).fetchone()
+            if count:
+                result.update(gpu_sm_active_avg_pct=average, gpu_sm_active_max_pct=maximum,
+                              gpu_metrics_samples=count)
+                return result
         metric_col = next((c for c in columns if c.lower() in {"sm active", "sms active"}), None)
         if metric_col:
             values = [float(row[0]) for row in db.execute(
@@ -317,32 +328,154 @@ def _ratio(base: float | None, compared: float | None) -> float | None:
     return base / compared
 
 
-def _run_speed_of_light(ncu: str, args: argparse.Namespace, tier_dir: Path,
-                        workers: int) -> None:
-    """Profile every GPU kernel in a separate, untimed production execution."""
+def _sol_inventory(path: Path) -> dict:
+    """Read symbols and observed launch configurations from the existing trace."""
+    inventory = {}
+    with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as db:
+        tables = {row[0] for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        table = next((name for name in (
+            "CUPTI_ACTIVITY_KIND_KERNEL", "CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL"
+        ) if name in tables), None)
+        if table is None:
+            raise ValueError("Nsight Systems export contains no GPU kernel inventory")
+        rows = db.execute(
+            f'SELECT n.value, d.value, k.gridX, k.gridY, k.gridZ, '
+            f'k.blockX, k.blockY, k.blockZ, k.staticSharedMemory, k.dynamicSharedMemory '
+            f'FROM "{table}" k LEFT JOIN StringIds n ON n.id=k.mangledName '
+            'LEFT JOIN StringIds d ON d.id=k.demangledName')
+        for symbol, name, *config in rows:
+            if not symbol:
+                raise ValueError("Nsight Systems export has a kernel without a mangled symbol")
+            entry = inventory.setdefault(symbol, {"name": name or symbol, "configurations": set()})
+            entry["configurations"].add(tuple(config))
+    if not inventory:
+        raise ValueError("Nsight Systems GPU kernel inventory is empty")
+    return inventory
+
+
+def _sol_samples(path: Path) -> dict:
+    """Read sampled symbols, launch configurations and required section metrics."""
+    samples = {}
+    with path.open(newline="", encoding="utf-8") as text:
+        reader = csv.DictReader(text)
+        units = next(reader)
+        required = ("sm__throughput.avg.pct_of_peak_sustained_elapsed",
+                    "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed",
+                    "sm__warps_active.avg.pct_of_peak_sustained_active",
+                    "launch__registers_per_thread")
+        for row in reader:
+            if not row.get("ID", "").isdigit():
+                continue
+            for key in required:
+                if not re.fullmatch(r"[0-9.,eE+\-]+", row.get(key, "")):
+                    raise ValueError(f"Missing Nsight Compute metric {key} for {row.get('Kernel Name')}")
+            def shared_bytes(key):
+                unit = units[key].split("/")[0]
+                scale = {"byte": 1, "Kbyte": 1000, "Mbyte": 1000000}[unit]
+                return round(float(row[key].replace(",", "")) * scale)
+            grid = tuple(map(int, re.findall(r"\d+", row["Grid Size"])))
+            block = tuple(map(int, re.findall(r"\d+", row["Block Size"])))
+            if len(grid) != 3 or len(block) != 3:
+                raise ValueError("Invalid launch geometry in Nsight Compute export")
+            config = (*grid, *block, shared_bytes("launch__shared_mem_per_block_static"),
+                      shared_bytes("launch__shared_mem_per_block_dynamic"))
+            entry = samples.setdefault(row["Kernel Name"], {"profiles": 0, "configurations": set()})
+            entry["profiles"] += 1
+            entry["configurations"].add(config)
+    return samples
+
+
+def _run_speed_of_light(ncu: str | None, args: argparse.Namespace, tier_dir: Path,
+                        workers: int) -> dict:
+    """Sample each kernel once; diagnostic failures do not discard benchmark results."""
     output = tier_dir / "speed-of-light"
+    if output.exists() and any(output.iterdir()):
+        output = tier_dir / f"speed-of-light-{time.time_ns()}"
     output.mkdir(parents=True, exist_ok=True)
     report = output / "profile.ncu-rep"
-    command = _pipeline_command(args, workers, "gpu", output / "catalog.csv")
+    command = _pipeline_command(args, 1, "gpu", output / "catalog.csv")
     env = dict(os.environ, NV_COMPUTE_PROFILER_DISABLE_STOCK_FILE_DEPLOYMENT="1")
-    print("Collecting Speed of Light, occupancy, and launch metrics for all GPU kernels. "
-          "Kernel replay can substantially extend profiling time; benchmark timings are separate.",
-          flush=True)
-    with (output / "profile.log").open("w", encoding="utf-8") as log:
-        subprocess.run(
-            [ncu, "--target-processes", "all", "--section", "SpeedOfLight",
-             "--section", "Occupancy", "--section", "LaunchStats",
-             "--export", str(report), *command],
-            stdout=log, stderr=subprocess.STDOUT, check=True, env=env,
-        )
-    if not report.is_file():
-        raise RuntimeError(f"Nsight Compute did not create {report}; see {output / 'profile.log'}")
-    with (output / "speed_of_light.txt").open("w", encoding="utf-8") as text:
-        subprocess.run(
-            [ncu, "--import", str(report), "--page", "details"],
-            stdout=text, stderr=subprocess.STDOUT, check=True, env=env,
-        )
-    print(f"Wrote {report} and {output / 'speed_of_light.txt'}", flush=True)
+    started = time.monotonic()
+    inventory, samples = {}, {}
+    status = {"status": "running", "reason": "", "exit_code": None,
+              "started_at_unix": time.time(), "benchmark_workers": workers,
+              "profiling_workers": 1, "sampling": "first invocation per mangled symbol",
+              "output_dir": str(output)}
+
+    def save():
+        missing = sorted(set(inventory) - set(samples))
+        status.update(elapsed_s=time.monotonic() - started,
+                      expected_kernel_count=len(inventory), observed_kernel_count=len(samples),
+                      missing_kernel_symbols=missing,
+                      unexpected_kernel_symbols=sorted(set(samples) - set(inventory)))
+        status["kernels"] = [{
+            "symbol": symbol, "name": inventory.get(symbol, {}).get("name", symbol),
+            "sampled_profiles": samples.get(symbol, {}).get("profiles", 0),
+            "sampled_configurations": sorted(samples.get(symbol, {}).get("configurations", set())),
+            "unmeasured_configurations": sorted(inventory.get(symbol, {}).get("configurations", set()) -
+                                                samples.get(symbol, {}).get("configurations", set())),
+        } for symbol in sorted(set(inventory) | set(samples))]
+        (output / "coverage.json").write_text(json.dumps(status, indent=2) + "\n", encoding="utf-8")
+        lines = [f"Speed of Light: {status['status'].upper()}", status["reason"],
+                 f"Benchmark workers: {workers}; SOL diagnostic workers: 1",
+                 f"Covered symbols: {len(set(inventory) & set(samples))}/{len(inventory)}",
+                 "One invocation per symbol; other launch configurations are not characterized.",
+                 f"Elapsed seconds: {status['elapsed_s']:.3f}", ""]
+        for kernel in status["kernels"]:
+            lines.extend([kernel["name"], "Symbol: " + kernel["symbol"],
+                          f"Profiles: {kernel['sampled_profiles']}; sampled configurations: "
+                          f"{kernel['sampled_configurations']}; unmeasured configurations: "
+                          f"{len(kernel['unmeasured_configurations'])}", ""])
+        (output / "coverage.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    save()
+    try:
+        inventory = _sol_inventory(tier_dir / "profile.sqlite")
+        save()
+        if getattr(args, "skip_speed_of_light", False):
+            status.update(status="skipped", reason="Requested --skip-speed-of-light")
+        else:
+            if not ncu:
+                raise FileNotFoundError("ncu not found; Speed of Light was not collected")
+            print(f"Collecting SOL for {len(inventory)} kernel symbols: one invocation each, "
+                  "one diagnostic process; timed worker allocation is unchanged.", flush=True)
+            with (output / "profile.log").open("w", encoding="utf-8") as log:
+                subprocess.run(
+                    [ncu, "--target-processes", "all", "--kernel-name-base", "mangled",
+                     "--kernel-id", ":::1", "--section", "SpeedOfLight",
+                     "--section", "Occupancy", "--section", "LaunchStats",
+                     "--export", str(report), *command],
+                    stdout=log, stderr=subprocess.STDOUT, check=True, env=env,
+                )
+            if not report.is_file():
+                raise ValueError("Nsight Compute did not create its binary report")
+            for page, options, filename in [
+                ("raw", ["--csv", "--print-kernel-base", "mangled"], "metrics.csv"),
+                ("details", [], "speed_of_light.txt"),
+            ]:
+                with (output / filename).open("w", encoding="utf-8") as text:
+                    subprocess.run([ncu, "--import", str(report), "--page", page, *options],
+                                   stdout=text, stderr=subprocess.STDOUT, check=True, env=env)
+                if page == "raw":
+                    samples = _sol_samples(output / filename)
+                    save()
+            missing = set(inventory) - set(samples)
+            status.update(status="incomplete" if missing else "complete", exit_code=0,
+                          reason=f"{len(missing)} expected symbols unmeasured" if missing else
+                          "All expected symbols sampled; additional configurations remain unmeasured")
+    except (OSError, ValueError, KeyError, StopIteration, csv.Error, sqlite3.Error,
+            subprocess.CalledProcessError) as error:
+        status.update(status="failed", reason=str(error),
+                      exit_code=getattr(error, "returncode", None))
+    except KeyboardInterrupt:
+        status.update(status="interrupted", reason="Interrupted by user")
+        raise
+    finally:
+        save()
+    print(f"Speed of Light: {status['status'].upper()} — {status['reason']}\n"
+          f"Coverage: {output / 'coverage.txt'}", flush=True)
+    return status
 
 
 def main(selected_tier: str | None = None) -> None:
@@ -379,8 +512,6 @@ def main(selected_tier: str | None = None) -> None:
     if not nsys:
         parser.error("nsys not found; load/install Nsight Systems on the Vista compute node")
     ncu = shutil.which("ncu")
-    if selected_tier in (None, "multicore_gpu") and not ncu:
-        parser.error("ncu not found; Nsight Compute is required for GPU Speed of Light profiling")
     if args.results_dir.exists() and any(args.results_dir.iterdir()):
         parser.error(f"results directory is not empty: {args.results_dir}; choose a new directory")
     args.results_dir.mkdir(parents=True, exist_ok=True)

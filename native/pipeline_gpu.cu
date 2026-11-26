@@ -4,6 +4,71 @@
 constexpr int INT_MAX = 2147483647;
 #define INFINITY (__longlong_as_double(0x7ff0000000000000ULL))
 
+// The distances on either side of a sorted row's median are ordered when
+// traversed away from the center. Select their kth merged value exactly.
+__device__ double deviation_rank(const double* row, int lo, int hi,
+                                double center, int rank) {
+    int left = (hi-lo)/2, right = hi-lo-left, split = lo+left;
+    int count = rank+1, low = max(0, count-right), high = min(count, left);
+    for (;;) {
+        int i = (low+high)/2, j = count-i;
+        double a = i ? fabs(row[split-i]-center) : -INFINITY;
+        double b = j ? fabs(row[split+j-1]-center) : -INFINITY;
+        double next_a = i < left ? fabs(row[split-i-1]-center) : INFINITY;
+        double next_b = j < right ? fabs(row[split+j]-center) : INFINITY;
+        if (a > next_b) high = i-1;
+        else if (b > next_a) low = i+1;
+        else return fmax(a, b);
+    }
+}
+
+extern "C" __global__ void clipped_mesh_medians(const double* samples,
+                                                double* result, int width) {
+    if (threadIdx.x) return;
+    const double* row = samples + (long long)blockIdx.x*width;
+    int lo = 0, hi = width;
+    while (lo < hi) {
+        int mid = lo+(hi-lo)/2;
+        if (isfinite(row[mid])) lo = mid+1;
+        else hi = mid;
+    }
+    hi = lo; lo = 0;
+    if (!hi) {
+        result[blockIdx.x] = __longlong_as_double(0x7ff8000000000000ULL);
+        return;
+    }
+    for (int iteration = 0; iteration < 6; ++iteration) {
+        int count = hi-lo, split = lo+count/2;
+        double center = (row[lo+(count-1)/2]+row[split])*.5;
+        double lower = deviation_rank(row, lo, hi, center, (count-1)/2);
+        double upper = count%2 ? lower : deviation_rank(row, lo, hi, center, count/2);
+        double noise = ((lower+upper)*.5)*1.4826;
+        if (noise == 0. || iteration == 5) {
+            result[blockIdx.x] = center;
+            return;
+        }
+        // Preserve the original absolute-difference predicate at roundoff ties.
+        int a = lo, b = split;
+        while (a < b) {
+            int mid = a+(b-a)/2;
+            if (fabs(row[mid]-center) <= 3.*noise) b = mid;
+            else a = mid+1;
+        }
+        int next_lo = a;
+        a = split; b = hi;
+        while (a < b) {
+            int mid = a+(b-a)/2;
+            if (fabs(row[mid]-center) <= 3.*noise) a = mid+1;
+            else b = mid;
+        }
+        if (next_lo == lo && a == hi) {
+            result[blockIdx.x] = center;
+            return;
+        }
+        lo = next_lo; hi = a;
+    }
+}
+
 extern "C" __global__ void fill_mesh(double* mesh, const bool* measured,
     const int* order, const double* cx, const double* cy, int nx, int ny,
     int accepted, int box, int* error) {

@@ -24,6 +24,101 @@ def gpu():
         pytest.skip("CUDA device required")
 
 
+@pytest.mark.parametrize("width", [1, 2, 17, 64, 4096])
+def test_mesh_clipping_exact_medians_and_padding(width):
+    rng = np.random.default_rng(379)
+    rows = rng.normal(100, 2, (41, width))
+    for i in range(len(rows)):
+        retained = (i*127) % (width+1)
+        rows[i, retained:] = np.inf
+    rows[1] = 7
+    if width >= 2:
+        rows[2, :2] = [-1e12, 1e12]
+        rows[3, -1] = 1e12
+    if width >= 17:
+        rows[4, :17] = np.nextafter(np.arange(17, dtype=np.float64), np.inf)
+        rows[5, :17] = [0]*8 + [1]*8 + [1000]
+    expected = np.array([background._clipped_stats(row[np.isfinite(row)])[0]
+                         if np.isfinite(row).any() else np.nan for row in rows])
+    work = Workspace(np.zeros((1, 1), np.float32), np.ones((1, 1), bool))
+    actual = work._mesh_medians(work.cp.asarray(rows)).get()
+    np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("mode", [0, 1, 2])
+@pytest.mark.parametrize("shape", [(1, 131), (131, 1), (17, 67)])
+def test_reconstruction_matches_global_fixed_point(mode, shape):
+    yy, xx = np.indices(shape)
+    labels = np.ones(shape, np.int32)
+    labels[(yy % 7 == 3) & (xx % 11 == 5)] = 0
+    if min(shape) > 1:
+        labels[shape[0]//3:2*shape[0]//3, shape[1]//3:shape[1]//2] = 2
+    mask = np.ones(shape, np.float64) if mode == 0 else np.zeros(shape, np.float64)
+    seed = np.zeros(shape, np.float64) if mode == 0 else np.full(shape, np.inf)
+    seed[0, 0] = 1 if mode == 0 else 0
+    seed[labels == 0] = 17
+    expected = seed.copy()
+    for _ in range(seed.size + 1):
+        updated = expected.copy()
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if not (dy or dx):
+                    continue
+                y = slice(max(0, -dy), min(shape[0], shape[0] - dy))
+                x = slice(max(0, -dx), min(shape[1], shape[1] - dx))
+                ny = slice(max(0, dy), min(shape[0], shape[0] + dy))
+                nx = slice(max(0, dx), min(shape[1], shape[1] + dx))
+                matching = (labels[y, x] != 0) & (labels[y, x] == labels[ny, nx])
+                neighbor = expected[ny, nx]
+                if mode == 2:
+                    matching &= mask[y, x] == mask[ny, nx]
+                    neighbor = neighbor + 1
+                operation = np.maximum if mode == 0 else np.minimum
+                updated[y, x] = np.where(matching, operation(updated[y, x], neighbor), updated[y, x])
+        if mode != 2:
+            operation = np.minimum if mode == 0 else np.maximum
+            updated = np.where(labels != 0, operation(updated, mask), updated)
+        if np.array_equal(updated, expected):
+            break
+        expected = updated
+    else:
+        pytest.fail("reference reconstruction did not converge")
+    work = Workspace(np.zeros(shape, np.float32), np.ones(shape, bool))
+    actual = work.reconstruct(work.cp.asarray(seed), work.cp.asarray(mask), work.cp.asarray(labels), mode)
+    np.testing.assert_array_equal(actual.get(), expected)
+
+
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize("sigma", [1., 2.])
+def test_workspace_filter_preserves_faint_pixels_and_cached_spectra(masked, sigma):
+    import math
+    shape = (1037, 1049)
+    pixels = np.random.default_rng(379).normal(1, .1, shape).astype(np.float32)
+    pixels[114, 118] = 1e6
+    valid = np.ones(shape, bool)
+    if masked:
+        valid[:, :21] = False
+        valid[491:503, 751:763] = False
+    work = Workspace(pixels, valid)
+    offsets = np.arange(-math.ceil(4*sigma), math.ceil(4*sigma)+1, dtype=np.float64)
+    weights = np.exp(-.5*(offsets/sigma)**2)
+    weights /= weights.sum()
+    kernel = np.outer(weights, weights).astype(np.float32).astype(np.float64)
+    radius = math.ceil(4*sigma)
+    coverage = np.pad(valid.astype(np.float64), radius, mode="symmetric")
+    for shift in (0., 3.):
+        data = pixels+shift
+        actual = work.smooth(work.cp.asarray(data), sigma, work.valid if masked else None).get()
+        padded = np.pad(np.where(valid, data, 0).astype(np.float64), radius, mode="symmetric")
+        for y, x in ((0, 23), (28, 44), (487, 754), (520, 777), (1036, 1048)):
+            window = np.s_[y:y+2*radius+1, x:x+2*radius+1]
+            numerator = np.sum(padded[window]*kernel, dtype=np.float64)
+            denominator = np.sum(coverage[window]*kernel, dtype=np.float64) if masked else 1.
+            expected = numerator/denominator if valid[y, x] and denominator >= .5 else 0.
+            assert actual[y, x] == pytest.approx(expected, rel=0, abs=5e-7)
+        assert len(work._gaussian_spectra) == 1
+
+
 @pytest.mark.parametrize("extended", [False, True])
 def test_known_sky_noise_and_blank(extended):
     yy, xx = np.mgrid[:384, :384]
