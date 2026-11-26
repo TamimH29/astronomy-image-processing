@@ -184,6 +184,16 @@ def _gpu_sample_metrics(db: sqlite3.Connection) -> dict:
                 return result
     if "GPU_METRICS" in tables:
         columns = _table_columns(db, "GPU_METRICS")
+        if {"typeId", "metricId", "value"}.issubset(columns) and "TARGET_INFO_GPU_METRICS" in tables:
+            count, average, maximum = db.execute(
+                'SELECT COUNT(*), AVG(g.value), MAX(g.value) FROM GPU_METRICS g '
+                'JOIN TARGET_INFO_GPU_METRICS m ON m.typeId=g.typeId AND m.metricId=g.metricId '
+                "WHERE m.metricName IN ('SMs Active [Throughput %]', 'SM Active [Throughput %]')"
+            ).fetchone()
+            if count:
+                result.update(gpu_sm_active_avg_pct=average, gpu_sm_active_max_pct=maximum,
+                              gpu_metrics_samples=count)
+                return result
         metric_col = next((c for c in columns if c.lower() in {"sm active", "sms active"}), None)
         if metric_col:
             values = [float(row[0]) for row in db.execute(

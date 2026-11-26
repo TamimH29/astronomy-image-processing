@@ -33,6 +33,7 @@ class Workspace:
         self.cp, self.ndimage = cp, ndimage
         self.profile = profile
         self.spans = []
+        self._gaussian_spectra = {}
         self.metrics = dict(explicit_h2d_bytes=pixels.nbytes + valid.nbytes,
                             catalog_d2h_bytes=0, scalar_d2h_bytes=0,
                             device_pool_peak_bytes=0)
@@ -109,52 +110,30 @@ class Workspace:
         h, w = self.shape
         grid = ((w+31)//32, (h+7)//8)
         active = cp.ones(grid[::-1], cp.int32)
+        next_active = cp.empty_like(active)
         other = seed.copy()
         kernel = self.module.get_function("reconstruct")
         while True:
             for _ in range(4):
-                next_active = cp.zeros_like(active)
+                next_active.fill(0)
                 kernel(grid, (32, 8), (seed, other, mask, labels, np.int32(h), np.int32(w),
                                       np.int32(mode), active, next_active))
-                # Inactive tiles must retain their converged values. Updating
-                # seed in place between launches is safe after the whole grid.
-                cp.copyto(seed, other)
-                active = next_active
+                # An inactive tile did not change in the preceding launch, so
+                # its values agree in both buffers. Active tiles write all pixels.
+                seed, other = other, seed
+                active, next_active = next_active, active
             if not self.scalar(cp.any(active)):
                 return seed
 
     def _mesh_medians(self, samples):
         cp = self.cp
-        # Positive infinity represents missing slots, never an observation.
-        # Row counts select exact odd/even medians despite unequal cell areas.
-        def median(sorted_values, counts):
-            lo = cp.maximum((counts-1)//2, 0)[:, None]
-            hi = cp.maximum(counts//2, 0)[:, None]
-            return ((cp.take_along_axis(sorted_values, lo, axis=1)[:, 0]
-                     + cp.take_along_axis(sorted_values, hi, axis=1)[:, 0]) * .5)
-        counts = cp.count_nonzero(cp.isfinite(samples), axis=1)
-        result = cp.full(samples.shape[0], cp.nan, cp.float64)
-        active = cp.flatnonzero(counts > 0)
-        samples, counts = samples[active], counts[active]
-        for iteration in range(6):
-            if not active.size:
-                break
-            samples = cp.sort(samples, axis=1)
-            center = median(samples, counts)
-            deviations = cp.where(cp.isfinite(samples), cp.abs(samples-center[:, None]), cp.inf)
-            noise = median(cp.sort(deviations, axis=1), counts)*1.4826
-            if iteration == 5:
-                result[active] = center
-                break
-            keep = cp.isfinite(samples) & ((noise[:, None] == 0) | (deviations <= 3*noise[:, None]))
-            retained = cp.count_nonzero(keep, axis=1)
-            finished = (noise == 0) | (retained == counts)
-            result[active[finished]] = center[finished]
-            # Retire converged cells from the batch. Continuing to sort those
-            # rows wastes most of the mesh time on later clipping iterations.
-            active = active[~finished]
-            samples = cp.where(keep, samples, cp.inf)[~finished]
-            counts = retained[~finished]
+        # Clipping keeps an interval of each sorted row. Select exact MADs
+        # from its two ordered deviation halves without sorting them again.
+        samples = cp.sort(samples, axis=1)
+        result = cp.empty(samples.shape[0], cp.float64)
+        if result.size:
+            self.module.get_function("clipped_mesh_medians")(
+                (result.size,), (32,), (samples, result, np.int32(samples.shape[1])))
         return result
 
     def _fit(self, source, box):
@@ -239,17 +218,24 @@ class Workspace:
 
     def smooth(self, pixels, sigma, valid=None):
         cp = self.cp
-        from cupyx.scipy.signal import fftconvolve
+        from cupyx.scipy import fft
         radius = math.ceil(4*sigma)
         # Construct the same float32 finite kernel ON DEVICE, then widen both
         # operands for cuFFT. The host filtering wrapper is never called here.
-        offsets = cp.arange(-radius, radius+1, dtype=cp.float64)
-        weights = cp.exp(-.5*(offsets/sigma)**2)
-        weights /= weights.sum()
-        kernel = (weights[:, None]*weights[None, :]).astype(cp.float32).astype(cp.float64)
+        fft_shape = tuple(fft.next_fast_len(n+4*radius, real=True) for n in pixels.shape)
+        key = (sigma, fft_shape)
+        if key not in self._gaussian_spectra:
+            offsets = cp.arange(-radius, radius+1, dtype=cp.float64)
+            weights = cp.exp(-.5*(offsets/sigma)**2)
+            weights /= weights.sum()
+            kernel = (weights[:, None]*weights[None, :]).astype(cp.float32).astype(cp.float64)
+            self._gaussian_spectra[key] = fft.rfftn(kernel, fft_shape)
+        spectrum = self._gaussian_spectra[key]
         def convolve(data):
-            return fftconvolve(cp.pad(data.astype(cp.float64), radius, mode="symmetric"),
-                               kernel, mode="valid").astype(cp.float32)
+            padded = cp.pad(data.astype(cp.float64), radius, mode="symmetric")
+            filtered = fft.irfftn(fft.rfftn(padded, fft_shape)*spectrum, fft_shape)
+            core = tuple(slice(2*radius, 2*radius+n) for n in data.shape)
+            return cp.ascontiguousarray(filtered[core], dtype=cp.float32)
         if valid is None:
             return convolve(pixels)
         numerator = convolve(cp.where(valid, pixels, 0))

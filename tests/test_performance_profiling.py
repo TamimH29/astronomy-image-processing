@@ -11,6 +11,21 @@ import pytest
 from final_scripts import compare_performance_nsys as profiling
 
 
+def test_systems_normalized_sm_metrics_use_metric_names_and_source_ids():
+    with sqlite3.connect(":memory:") as db:
+        db.executescript("""
+            CREATE TABLE TARGET_INFO_GPU_METRICS (typeId INTEGER, metricId INTEGER, metricName TEXT);
+            CREATE TABLE GPU_METRICS (typeId INTEGER, metricId INTEGER, value REAL);
+            INSERT INTO TARGET_INFO_GPU_METRICS VALUES
+                (1, 7, 'SMs Active [Throughput %]'), (1, 8, 'SM Issue [Throughput %]'),
+                (2, 7, 'DRAM Read Bandwidth [Throughput %]');
+            INSERT INTO GPU_METRICS VALUES (1, 7, 20), (1, 7, 80), (1, 8, 1), (2, 7, 99);
+        """)
+        assert profiling._gpu_sample_metrics(db) == {
+            "gpu_sm_active_avg_pct": 50.0, "gpu_sm_active_max_pct": 80.0,
+            "gpu_metrics_samples": 2}
+
+
 @pytest.fixture
 def trace(tmp_path):
     with sqlite3.connect(tmp_path / "profile.sqlite") as db:

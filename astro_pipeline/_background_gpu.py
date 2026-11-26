@@ -7,10 +7,24 @@ three scalars per clipping pass. CuPy compaction can also synchronize internally
 from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager, nullcontext
+from functools import lru_cache
 from importlib import import_module
 from time import perf_counter
 
 import numpy as np
+
+
+@lru_cache(maxsize=None)
+def _clipping_kernels(device):
+    import cupy as cp
+    return (
+        cp.ElementwiseKernel("float64 sample, float64 center", "float64 deviation",
+                             "deviation = fabs(sample - center)",
+                             "background_deviation", options=("--fmad=false",)),
+        cp.ElementwiseKernel("float64 sample, float64 center, float64 noise", "bool keep",
+                             "keep = fabs(sample - center) <= 3.0 * noise",
+                             "background_clip_mask", options=("--fmad=false",)),
+    )
 
 
 def clipped_statistics_device(samples, scratch, keep_buffer, observe, *, timed=nullcontext):
@@ -22,19 +36,17 @@ def clipped_statistics_device(samples, scratch, keep_buffer, observe, *, timed=n
     import cupy as cp
     if not samples.size:
         raise ValueError("insufficient background coverage: no source-free observations")
+    deviation, clip_mask = _clipping_kernels(cp.cuda.runtime.getDevice())
     passes = 0
     for iteration in range(6):
         with timed():
             center = cp.median(samples, overwrite_input=True)
             deviations = scratch[:samples.size]
-            cp.subtract(samples, center, out=deviations)
-            cp.abs(deviations, out=deviations)
+            deviation(samples, center, deviations)
             noise = cp.median(deviations, overwrite_input=True)*cp.float64(1.4826)
             keep = keep_buffer[:samples.size]
-            # Selection rearranges deviations; rebuild correspondence to samples.
-            cp.subtract(samples, center, out=deviations)
-            cp.abs(deviations, out=deviations)
-            cp.less_equal(deviations, 3*noise, out=keep)
+            # Selection rearranges deviations; form the mask from samples.
+            clip_mask(samples, center, noise, keep)
             count = cp.count_nonzero(keep)
         noise_value, kept = observe(center, noise, count)
         if noise_value == 0 or kept == samples.size or iteration == 5:
