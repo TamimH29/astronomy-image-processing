@@ -8,6 +8,8 @@ single-process diagnostics, not timings for the multicore worker pool.
 GPU tiers also sample one invocation per fully qualified GPU kernel in a separate
 single-process Nsight Compute run, collecting SpeedOfLight, Occupancy, and
 LaunchStats with an explicit coverage report.
+Use --wall-clock-only to run just the unprofiled repetitions and speedup
+comparison, without profiler tools, hardware counters, or stage diagnostics.
 
 Example on a Vista GH node (from the repository root):
   python final_scripts/compare_performance_nsys.py \
@@ -489,13 +491,15 @@ def main(selected_tier: str | None = None) -> None:
     parser.add_argument("--mask-zero-border", action="store_true")
     parser.add_argument("--no-background-refinement", action="store_true")
     parser.add_argument("--no-deblend", action="store_true")
+    parser.add_argument("--wall-clock-only", action="store_true",
+                        help="run only unprofiled timing repetitions; skip all diagnostics")
     args = parser.parse_args()
 
     if args.repeats < 1:
         parser.error("--repeats must be positive")
     if args.cpu_workers is not None and args.cpu_workers < 1:
         parser.error("--cpu-workers must be positive")
-    if selected_tier is None and args.cpu_workers is None:
+    if selected_tier is None and args.cpu_workers is None and not args.wall_clock_only:
         parser.error("--cpu-workers is required when comparing all tiers")
     if selected_tier == "single_core_cpu" and args.cpu_workers not in (None, 1):
         parser.error("the single-core script always uses exactly one worker")
@@ -504,10 +508,12 @@ def main(selected_tier: str | None = None) -> None:
     paths = _input_paths(args.input)
     if not paths:
         parser.error(f"no FITS files found for {args.input!r}")
-    nsys = shutil.which("nsys")
-    if not nsys:
-        parser.error("nsys not found; load/install Nsight Systems on the Vista compute node")
-    ncu = shutil.which("ncu")
+    nsys = ncu = perf = None
+    if not args.wall_clock_only:
+        nsys = shutil.which("nsys")
+        if not nsys:
+            parser.error("nsys not found; load/install Nsight Systems on the Vista compute node")
+        ncu = shutil.which("ncu")
     if args.results_dir.exists() and any(args.results_dir.iterdir()):
         parser.error(f"results directory is not empty: {args.results_dir}; choose a new directory")
     args.results_dir.mkdir(parents=True, exist_ok=True)
@@ -532,12 +538,15 @@ def main(selected_tier: str | None = None) -> None:
             print(f"note: {len(paths)} files limit run_batch to at most {len(paths)} workers")
         print(f"inputs: {len(paths)}; requested multicore workers: {cpu_workers}; "
               f"expected effective workers: {effective_workers}")
-    nsys_version = subprocess.run(
-        [nsys, "--version"], check=True, text=True, capture_output=True
-    ).stdout.strip()
-    print(f"nsys: {nsys_version}")
-    perf = shutil.which("perf")
-    print(f"perf: {'available' if perf else 'not found (CPU counters will be empty)'}")
+    if args.wall_clock_only:
+        print("Wall-clock-only comparison: unprofiled pipeline executions.", flush=True)
+    else:
+        nsys_version = subprocess.run(
+            [nsys, "--version"], check=True, text=True, capture_output=True
+        ).stdout.strip()
+        print(f"nsys: {nsys_version}")
+        perf = shutil.which("perf")
+        print(f"perf: {'available' if perf else 'not found (CPU counters will be empty)'}")
 
     if selected_tier is None:
         configurations = [
@@ -560,6 +569,21 @@ def main(selected_tier: str | None = None) -> None:
             command = _pipeline_command(args, workers, pipeline_backend, output)
             elapsed = _run_logged(command, tier_dir / f"run_repeat_{repeat + 1}.log", timed=True)
             samples.append(elapsed)
+            if args.wall_clock_only:
+                print(f"{tier}: repeat {repeat + 1}/{args.repeats}: {elapsed:.3f} s", flush=True)
+        timing = {
+            "tier": tier,
+            "workers_requested": workers,
+            "workers_effective": min(workers, len(paths)),
+            "pipeline_backend": pipeline_backend,
+            "repeats": args.repeats,
+            "wall_samples_s": json.dumps(samples),
+            "median_wall_s": statistics.median(samples),
+        }
+        if args.wall_clock_only:
+            timing["throughput_images_s"] = len(paths) / timing["median_wall_s"]
+            summaries.append(timing)
+            continue
         # One independent hardware-counter run; it is not used for headline timing.
         perf_metrics = _run_perf(perf, _pipeline_command(
             args, workers, pipeline_backend, tier_dir / "catalog_perf.csv"), tier_dir,
@@ -594,13 +618,7 @@ def main(selected_tier: str | None = None) -> None:
         metrics = _nsys_metrics(nsys, report)
         stage_timings = _run_stage_timing(args, tier_dir, pipeline_backend, len(paths))
         summaries.append({
-            "tier": tier,
-            "workers_requested": workers,
-            "workers_effective": min(workers, len(paths)),
-            "pipeline_backend": pipeline_backend,
-            "repeats": args.repeats,
-            "wall_samples_s": json.dumps(samples),
-            "median_wall_s": statistics.median(samples),
+            **timing,
             "profiled_wall_s_diagnostic_only": profile_wall,
             "nsys_report": str(report),
             "gpu_metrics_status": gpu_metrics_status,
@@ -634,6 +652,17 @@ def main(selected_tier: str | None = None) -> None:
             "multicore worker-stage aggregates. Per-kernel occupancy requires Nsight Compute."
         ),
     }
+    if args.wall_clock_only:
+        comparison.pop("nsys_metrics_note")
+        comparison.pop("additional_metrics_note")
+        comparison.update(
+            measurement="wall_clock_only", input=args.input, input_count=len(paths),
+            tile_size=args.tile_size, repeats=args.repeats,
+            measurement_note=(
+                "Median subprocess wall time includes Python/worker startup, FITS reading, "
+                "pipeline processing, and catalog writing. No diagnostic passes are run."
+            ),
+        )
     if selected_tier is None:
         by_tier = {row["tier"]: row for row in summaries}
         cpu1 = by_tier["single_core_cpu"]["median_wall_s"]
@@ -651,18 +680,22 @@ def main(selected_tier: str | None = None) -> None:
         )
     (args.results_dir / "comparison.json").write_text(
         json.dumps(comparison, indent=2) + "\n", encoding="utf-8")
-    print("\nMedian unprofiled wall times and collected diagnostics:")
+    print("\nMedian unprofiled wall times:")
     for row in summaries:
-        print(f"{row['tier']:20s} {row['median_wall_s']:9.3f} s  "
-              f"kernels={row['gpu_kernel_count']} "
-              f"kernel_sum={row['gpu_kernel_sum_ms']} ms "
-              f"memcpy_sum={row['gpu_memcpy_sum_ms']} ms "
-              f"CPU_util={row['cpu_utilization_pct_of_workers']}% "
-              f"SM_active_avg={row['gpu_sm_active_avg_pct']}%")
+        if args.wall_clock_only:
+            print(f"{row['tier']:20s} {row['median_wall_s']:9.3f} s  "
+                  f"{row['throughput_images_s']:.3f} images/s")
+        else:
+            print(f"{row['tier']:20s} {row['median_wall_s']:9.3f} s  "
+                  f"kernels={row['gpu_kernel_count']} "
+                  f"kernel_sum={row['gpu_kernel_sum_ms']} ms "
+                  f"memcpy_sum={row['gpu_memcpy_sum_ms']} ms "
+                  f"CPU_util={row['cpu_utilization_pct_of_workers']}% "
+                  f"SM_active_avg={row['gpu_sm_active_avg_pct']}%")
     print(f"\nWrote {args.results_dir / 'summary.csv'} and "
           f"{args.results_dir / 'comparison.json'}")
     for tier, workers, pipeline_backend in configurations:
-        if pipeline_backend == "gpu":
+        if pipeline_backend == "gpu" and not args.wall_clock_only:
             tier_dir = args.results_dir if selected_tier else args.results_dir / tier
             _run_speed_of_light(ncu, args, tier_dir, workers)
 

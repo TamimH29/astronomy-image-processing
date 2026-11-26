@@ -4,11 +4,68 @@ import csv
 import json
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from final_scripts import compare_performance_nsys as profiling
+
+
+@pytest.mark.parametrize("selected_tier", [None, "multicore_gpu"])
+def test_wall_clock_mode_needs_no_profilers_and_preserves_pipeline_settings(
+        monkeypatch, tmp_path, selected_tier):
+    output = tmp_path / "results"
+    monkeypatch.setattr(sys, "argv", [
+        "compare_performance_nsys.py", "--wall-clock-only", "--input", "real-images",
+        "--results-dir", str(output), "--repeats", "3", "--tile-size", "1024",
+    ])
+    monkeypatch.setattr(profiling, "_input_paths", lambda _: [f"frame-{i}.fits" for i in range(100)])
+    monkeypatch.setenv("SLURM_CPUS_PER_TASK", "72")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Wall-clock mode attempted to discover or run diagnostic tools")
+
+    monkeypatch.setattr(profiling.shutil, "which", forbidden)
+    monkeypatch.setattr(profiling.subprocess, "run", forbidden)
+    for name in ("_run_perf", "_nsys_metrics", "_run_stage_timing", "_run_speed_of_light"):
+        monkeypatch.setattr(profiling, name, forbidden)
+    samples = {"single_core_cpu": [8., 4., 6.], "multicore_cpu": [2., 1., 3.],
+               "multicore_gpu": [1., .5, .75]}
+    calls = []
+
+    def timed(command, log_path, *, timed):
+        tier = log_path.parent.name if selected_tier is None else selected_tier
+        calls.append((tier, command))
+        assert timed
+        assert command[:3] == [sys.executable, "-m", "astro_pipeline.run_pipeline"]
+        assert command[command.index("--workers")+1] == ("1" if tier == "single_core_cpu" else "72")
+        assert command[command.index("--pipeline-backend")+1] == ("gpu" if tier == "multicore_gpu" else "staged")
+        assert command[command.index("--tile-size")+1] == "1024"
+        assert command[command.index("--backend")+1] == "cpu"
+        assert command[command.index("--kernel-sigma")+1] == "2.0"
+        assert command[command.index("--threshold-sigma")+1] == "3.0"
+        return samples[tier].pop(0)
+
+    monkeypatch.setattr(profiling, "_run_logged", timed)
+    profiling.main(selected_tier)
+    with (output / "summary.csv").open() as stream:
+        rows = list(csv.DictReader(stream))
+    comparison = json.loads((output / "comparison.json").read_text())
+    assert comparison["measurement"] == "wall_clock_only"
+    assert comparison["input_count"] == 100
+    assert comparison["tile_size"] == 1024
+    assert comparison["repeats"] == 3
+    assert len(calls) == (9 if selected_tier is None else 3)
+    assert float(rows[-1]["median_wall_s"]) == .75
+    assert float(rows[-1]["throughput_images_s"]) == pytest.approx(100/.75)
+    assert "profiled_wall_s_diagnostic_only" not in rows[-1]
+    if selected_tier is None:
+        assert comparison["speedups_from_unprofiled_median_wall_time"] == {
+            "multicore_cpu_vs_single_core_cpu": 3.,
+            "multicore_gpu_vs_multicore_cpu": pytest.approx(2/.75),
+            "multicore_gpu_vs_single_core_cpu": 8.,
+        }
 
 
 def test_systems_normalized_sm_metrics_use_metric_names_and_source_ids():
