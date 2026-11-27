@@ -6,3 +6,6 @@ build*/
 *.o
 /benchmarks/results/
 /.venv/
+/.tools/
+/.conda-env/
+/.conda-pkgs/

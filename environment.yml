@@ -1,0 +1,17 @@
+name: astronomy-cuda12
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12
+  - numpy>=2.0,<2.5
+  - scipy>=1.14,<1.18
+  - astropy>=7,<9
+  - pytest>=8,<10
+  - cupy=14.2
+  - cuda-version=12.9
+  - cuda-nvcc=12.9
+  - pybind11>=2.13,<4
+  - cmake>=3.24,<4
+  - ninja
+  - gxx_linux-64=13
